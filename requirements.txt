@@ -1,0 +1,10 @@
+shiny
+seminr
+tidyverse
+readxl
+openxlsx
+ggplot2
+dplyr
+DiagrammeR
+DT
+htmlwidgets
