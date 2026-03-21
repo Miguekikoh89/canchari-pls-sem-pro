@@ -12,6 +12,7 @@
 
 library(shiny)
 library(shinydashboard)
+library(shinyWidgets)
 library(readxl)
 library(seminr)
 library(tidyverse)
@@ -26,6 +27,11 @@ if (has_rsvg)          library(rsvg)
 library(glue)
 library(officer)
 library(flextable)
+library(ggplot2)
+library(openxlsx)
+library(svglite)
+library(grid)
+has_knitr <- requireNamespace("knitr", quietly = TRUE)
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -728,6 +734,323 @@ interpretar_plssem <- function(tables, lng = "es") {
 }
 
 
+# ============================================================================
+# GAUSSIAN COPULA ENDOGENEITY TEST  — v3.0
+# Park & Gupta (2012) adapted for PLS-SEM robustness testing
+# ============================================================================
+
+# ── Helper: build scores_df from either PLS construct scores OR composite means ──
+build_scores_df <- function(pls_est, data_raw, construct_items_map, use_mean_scores = FALSE) {
+  if (use_mean_scores && !is.null(data_raw) && !is.null(construct_items_map)) {
+    # Composite mean scores: rowMeans of each construct's indicators
+    df <- as.data.frame(
+      lapply(names(construct_items_map), function(cn) {
+        items <- intersect(construct_items_map[[cn]], names(data_raw))
+        if (length(items) == 0) return(rep(NA_real_, nrow(data_raw)))
+        rowMeans(data_raw[, items, drop = FALSE], na.rm = FALSE)
+      })
+    )
+    names(df) <- names(construct_items_map)
+    return(df)
+  }
+  # Default: PLS latent scores with 3-level fallback
+  tryCatch(as.data.frame(pls_est$construct_scores),          error = function(e) NULL) %||%
+  tryCatch(as.data.frame(pls_est$constructScores),           error = function(e) NULL) %||%
+  tryCatch(as.data.frame(seminr::construct_scores(pls_est)), error = function(e) NULL)
+}
+
+# ── Core copula regression ────────────────────────────────────────────────────
+run_gaussian_copula <- function(scores_df, p_df, paths_table = NULL, lang = "es") {
+  # paths_table: the app's results$tables$Paths — used to look up actual PLS betas
+  # Detect endogenous constructs (appear as "to" in paths)
+  endogenous <- unique(p_df$to)
+  all_from   <- unique(p_df$from)
+  exogenous  <- setdiff(all_from, endogenous)
+
+  if (length(exogenous) == 0)
+    stop("No se encontraron variables exógenas en el modelo estructural.")
+  if (length(endogenous) == 0)
+    stop("No se encontraron variables endógenas en el modelo estructural.")
+
+  exogenous  <- intersect(exogenous,  names(scores_df))
+  endogenous <- intersect(endogenous, names(scores_df))
+
+  if (length(exogenous) == 0 || length(endogenous) == 0)
+    stop("Los scores de los constructos no contienen variables del modelo. Ejecute el análisis PLS primero.")
+
+  # Build PLS beta lookup from Paths table if available
+  pls_beta_lookup <- list()
+  if (!is.null(paths_table) && is.data.frame(paths_table) && nrow(paths_table) > 0 &&
+      "Path" %in% names(paths_table) && "Beta" %in% names(paths_table)) {
+    for (k in seq_len(nrow(paths_table))) {
+      key <- gsub("\\s+", "", as.character(paths_table$Path[k]))
+      pls_beta_lookup[[key]] <- suppressWarnings(as.numeric(paths_table$Beta[k]))
+    }
+  }
+
+  rows <- list()
+
+  for (y_nm in endogenous) {
+    preds <- p_df$from[p_df$to == y_nm]
+    preds <- intersect(preds, names(scores_df))
+    if (length(preds) == 0) next
+
+    y_vec <- as.numeric(scores_df[[y_nm]])
+
+    for (x_nm in preds) {
+      x_vec <- as.numeric(scores_df[[x_nm]])
+
+      # NA removal — joint complete cases for X and Y
+      valid <- !is.na(x_vec) & !is.na(y_vec)
+      if (sum(valid) < 10) next
+      xv <- x_vec[valid]
+      yv <- y_vec[valid]
+      n  <- length(xv)
+
+      # ── Park & Gupta (2012) copula construction ──
+      ranks       <- rank(xv, ties.method = "average")
+      uniform     <- ranks / (n + 1)                     # formula: rank/(n+1)
+      copula_term <- qnorm(uniform)                       # Φ⁻¹
+
+      # ── Build regression data (safe names to avoid collisions) ──
+      other_preds <- setdiff(preds, x_nm)
+      other_preds <- intersect(other_preds, names(scores_df))
+      # Use internal safe column names to avoid collisions with construct names
+      reg_data    <- data.frame(Y_end = yv, X_pred = xv, Cop_term = copula_term,
+                                stringsAsFactors = FALSE)
+      op_safe     <- character(0)
+      for (op in other_preds) {
+        safe_nm          <- paste0("ctrl_", make.names(op))
+        reg_data[[safe_nm]] <- as.numeric(scores_df[[op]])[valid]
+        op_safe          <- c(op_safe, safe_nm)
+      }
+      # Remove rows where any ctrl predictor is NA
+      reg_data <- reg_data[complete.cases(reg_data), , drop = FALSE]
+      n_reg    <- nrow(reg_data)
+      if (n_reg < 10) next
+
+      fml_str <- paste0("Y_end ~ X_pred + Cop_term",
+                        if (length(op_safe)) paste0(" + ", paste(op_safe, collapse = " + ")) else "")
+      fml     <- as.formula(fml_str)
+
+      fit <- tryCatch(stats::lm(fml, data = reg_data), error = function(e) NULL)
+      if (is.null(fit)) next
+
+      cs <- tryCatch(summary(fit)$coefficients, error = function(e) NULL)
+      if (is.null(cs) || !"Cop_term" %in% rownames(cs)) next
+
+      copula_coef <- cs["Cop_term", "Estimate"]
+      copula_se   <- cs["Cop_term", "Std. Error"]
+      copula_t    <- cs["Cop_term", "t value"]
+      copula_p    <- cs["Cop_term", "Pr(>|t|)"]
+      ci_lo       <- copula_coef - 1.96 * copula_se
+      ci_hi       <- copula_coef + 1.96 * copula_se
+
+      # ── Look up ACTUAL PLS beta (not bivariate OLS) ──
+      path_key   <- gsub("\\s+", "", paste0(x_nm, "->", y_nm))
+      path_key2  <- gsub("\\s+", "", paste0(x_nm, "\u2192", y_nm))
+      pls_beta   <- pls_beta_lookup[[path_key]] %||%
+                    pls_beta_lookup[[path_key2]] %||%
+                    NA_real_
+
+      interp <- if (is.na(copula_p)) "N/A"
+                else if (copula_p < 0.05) {
+                  if (lang == "en") "\u26a0 Potential endogeneity detected (p < 0.05)"
+                  else              "\u26a0 Posible endogeneidad detectada (p < 0.05)"
+                } else {
+                  if (lang == "en") "\u2713 No evidence of endogeneity (p \u2265 0.05)"
+                  else              "\u2713 Sin evidencia de endogeneidad (p \u2265 0.05)"
+                }
+
+      # Human-readable formula for the "Technical Details" box
+      fml_human <- paste0(y_nm, " ~ ", x_nm, " + Copula(",  x_nm, ")",
+                          if (length(other_preds)) paste0(" + ", paste(other_preds, collapse = " + ")) else "")
+
+      rows[[length(rows) + 1]] <- data.frame(
+        Path          = paste0(x_nm, " \u2192 ", y_nm),
+        Predictor     = x_nm,
+        Endogenous    = y_nm,
+        PLS_Beta      = round(pls_beta,   4),   # actual PLS bootstrapped beta
+        Copula_Coef   = round(copula_coef, 4),
+        Std_Error     = round(copula_se,   4),
+        t_value       = round(copula_t,    3),
+        p_value       = round(copula_p,    4),
+        CI_lo         = round(ci_lo,       4),
+        CI_hi         = round(ci_hi,       4),
+        N_used        = n_reg,
+        Formula       = fml_human,
+        Interpretation = interp,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  if (length(rows) == 0)
+    stop("No se pudo calcular la Cópula Gaussiana. Verifique el modelo estructural.")
+
+  do.call(rbind, rows)
+}
+
+# ── Plot A: Forest / Dot-and-Whisker (main results plot) ─────────────────────
+make_copula_results_plot <- function(copula_tbl) {
+  req_cols <- c("Path", "PLS_Beta", "Copula_Coef", "CI_lo", "CI_hi", "p_value")
+  if (is.null(copula_tbl) || !all(req_cols %in% names(copula_tbl))) return(NULL)
+
+  df <- copula_tbl[!is.na(copula_tbl$Copula_Coef), ]
+  if (nrow(df) == 0) return(NULL)
+
+  # Significance flag
+  df$sig_label <- ifelse(!is.na(df$p_value),
+                         paste0("p = ", formatC(df$p_value, digits = 4, format = "f")), "")
+  df$sig_color <- ifelse(!is.na(df$p_value) & df$p_value < 0.05, "#C62828", "#2E7D32")
+  df$point_shape<- ifelse(!is.na(df$p_value) & df$p_value < 0.05, 18, 16)
+
+  # Overall verdict annotation
+  any_endo   <- any(df$p_value < 0.05, na.rm = TRUE)
+  annot_text <- if (any_endo) "\u26a0 Potential endogeneity detected in at least one path"
+                else            "\u2713 No evidence of endogeneity detected"
+  annot_col  <- if (any_endo) "#C62828" else "#2E7D32"
+
+  # Path as factor, ordered by Copula_Coef
+  df$Path <- factor(df$Path, levels = df$Path[order(df$Copula_Coef)])
+
+  # Reference segments for PLS_Beta (faint)
+  has_pls <- !all(is.na(df$PLS_Beta))
+
+  p <- ggplot(df, aes(x = Copula_Coef, y = Path)) +
+    # Reference line at 0
+    geom_vline(xintercept = 0, linetype = "dashed", color = "#888888", linewidth = 0.6) +
+    # PLS Beta as faint reference diamond
+    { if (has_pls)
+        geom_point(aes(x = PLS_Beta), shape = 5, size = 3.5, color = "#1565C0",
+                   alpha = 0.45, stroke = 1.2)
+      else list() } +
+    # 95% CI whiskers
+    geom_errorbarh(aes(xmin = CI_lo, xmax = CI_hi),
+                   height = 0.25, linewidth = 0.9, color = "#555555") +
+    # Copula coefficient point
+    geom_point(aes(color = sig_color, shape = point_shape),
+               size = 4.5, stroke = 1) +
+    scale_color_identity() +
+    scale_shape_identity() +
+    # p-value labels
+    geom_text(aes(x = CI_hi, label = sig_label),
+              hjust = -0.12, size = 3.2, color = "#333333", fontface = "italic") +
+    # Overall verdict annotation
+    annotate("text",
+             x = max(c(df$CI_hi, df$PLS_Beta), na.rm = TRUE) * 1.05,
+             y = Inf, label = annot_text,
+             hjust = 1, vjust = 1.8, size = 3.5, color = annot_col, fontface = "bold") +
+    # Legend guide for PLS Beta reference
+    { if (has_pls)
+        annotate("text", x = -Inf, y = -Inf,
+                 label = "\u25c7 = PLS bootstrapped \u03b2 (reference)",
+                 hjust = -0.05, vjust = -0.8, size = 3, color = "#1565C0", alpha = 0.7)
+      else list() } +
+    scale_x_continuous(expand = expansion(mult = c(0.05, 0.28))) +
+    labs(
+      title    = "Gaussian Copula Endogeneity Test",
+      subtitle = "Forest plot \u2014 Copula coefficient with 95% CI per structural path",
+      x        = "Copula Coefficient (\u03b2\u2082)",
+      y        = "Structural Path",
+      caption  = paste0(
+        "Filled circle (\u25cf) = Copula coeff.; \u25c7 = PLS bootstrapped \u03b2 (reference). ",
+        "Red \u25c6 = p < 0.05. CI = 1.96 \u00d7 SE.\n",
+        "Reference: Park & Gupta (2012). Marketing Science, 31(2), 317\u2013333."
+      )
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title      = element_text(face = "bold", color = "#1A237E", size = 15),
+      plot.subtitle   = element_text(color = "#555555", size = 11),
+      plot.caption    = element_text(size = 8.5, color = "#666666"),
+      axis.text.y     = element_text(size = 11, face = "bold"),
+      axis.text.x     = element_text(size = 10),
+      panel.grid.major.y = element_blank(),
+      panel.grid.major.x = element_line(color = "#EEEEEE"),
+      panel.border    = element_rect(color = "#CCCCCC", fill = NA),
+      plot.margin     = margin(12, 60, 12, 12)
+    )
+
+  p
+}
+
+# ── Plot B: Copula Visualization (rank-normal scatter / contour) ─────────────
+make_copula_visualization_plot <- function(scores_df, x_nm, y_nm, view_type = "scatter") {
+  if (is.null(scores_df)) return(NULL)
+  if (!(x_nm %in% names(scores_df)) || !(y_nm %in% names(scores_df))) return(NULL)
+
+  xv <- as.numeric(scores_df[[x_nm]])
+  yv <- as.numeric(scores_df[[y_nm]])
+  valid <- !is.na(xv) & !is.na(yv)
+  if (sum(valid) < 10) return(NULL)
+
+  xv <- xv[valid]; yv <- yv[valid]
+  n  <- length(xv)
+
+  zX <- qnorm(rank(xv, ties.method = "average") / (n + 1))
+  zY <- qnorm(rank(yv, ties.method = "average") / (n + 1))
+
+  df_viz <- data.frame(zX = zX, zY = zY)
+
+  path_lbl <- paste0(x_nm, " \u2192 ", y_nm)
+  caption_txt <- paste0(
+    "Rank-normal transformed variables (z_X, z_Y) used in the Gaussian Copula procedure.\n",
+    "Formula: z = \u03a6\u207b\u00b9(rank(x)/(n+1))  |  N = ", n
+  )
+
+  if (view_type == "contour") {
+    p <- ggplot(df_viz, aes(x = zX, y = zY)) +
+      geom_density_2d_filled(contour_var = "density", alpha = 0.85, bins = 10) +
+      geom_density_2d(color = "white", linewidth = 0.35, alpha = 0.6) +
+      geom_point(alpha = 0.25, size = 1.2, color = "#1A237E") +
+      scale_fill_viridis_d(option = "plasma", name = "Density", direction = -1) +
+      labs(
+        title    = paste0("Copula Visualization \u2014 2D Density: ", path_lbl),
+        subtitle = "Contour/density plot of rank-normal transformed variables",
+        x        = paste0("z_", x_nm, " = \u03a6\u207b\u00b9(rank(", x_nm, ")/(n+1))"),
+        y        = paste0("z_", y_nm, " = \u03a6\u207b\u00b9(rank(", y_nm, ")/(n+1))"),
+        caption  = caption_txt
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        plot.title    = element_text(face = "bold", color = "#1A237E", size = 14),
+        plot.subtitle = element_text(color = "#555555", size = 10),
+        plot.caption  = element_text(size = 8.5, color = "#666666"),
+        panel.border  = element_rect(color = "#CCCCCC", fill = NA),
+        legend.position = "right"
+      )
+  } else {
+    # scatter + smooth density overlay (stat_density_2d)
+    p <- ggplot(df_viz, aes(x = zX, y = zY)) +
+      stat_density_2d(aes(fill = after_stat(level)), geom = "polygon",
+                      alpha = 0.35, bins = 9, color = NA) +
+      scale_fill_gradient(low = "#E3F2FD", high = "#1565C0", name = "Density") +
+      geom_point(alpha = 0.55, size = 2, color = "#1A237E") +
+      geom_smooth(method = "lm", se = TRUE, color = "#E53935",
+                  fill = "#EF9A9A", linewidth = 1, linetype = "solid") +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "#999999", linewidth = 0.4) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "#999999", linewidth = 0.4) +
+      labs(
+        title    = paste0("Copula Visualization \u2014 Scatter + Density: ", path_lbl),
+        subtitle = "Rank-normal transformed variables with linear trend and density overlay",
+        x        = paste0("z_", x_nm, " = \u03a6\u207b\u00b9(rank(", x_nm, ")/(n+1))"),
+        y        = paste0("z_", y_nm, " = \u03a6\u207b\u00b9(rank(", y_nm, ")/(n+1))"),
+        caption  = caption_txt
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        plot.title    = element_text(face = "bold", color = "#1A237E", size = 14),
+        plot.subtitle = element_text(color = "#555555", size = 10),
+        plot.caption  = element_text(size = 8.5, color = "#666666"),
+        panel.border  = element_rect(color = "#CCCCCC", fill = NA),
+        legend.position = "right"
+      )
+  }
+
+  p
+}
+
 # ── get_num_col helper ────────────────────────────────────────────────────────
 
 get_num_col <- function(df, exact_names = character(0), regex_pats = character(0)) {
@@ -794,6 +1117,10 @@ ui <- dashboardPage(
         table.dataTable thead { background:#1565C0; color:white; }
         .nav-tabs > li.active > a { color:#1565C0; font-weight:bold; border-top:3px solid #1565C0; }
         #interp_panel { background:#fff; border-left:4px solid #1565C0; padding:14px; border-radius:4px; font-size:13px; line-height:1.8; }
+      ")),
+      tags$script(HTML("
+        // pickerInput (shinyWidgets) gestiona su propio binding Shiny nativo.
+        // No se requiere JS adicional para c_picker_.
       "))
     ),
 
@@ -844,7 +1171,10 @@ ui <- dashboardPage(
               br(), br(),
               uiOutput("construct_inputs"),
               br(),
-              uiOutput("add_construct_ui")
+              fluidRow(
+                column(6, uiOutput("add_construct_ui")),
+                column(6, uiOutput("clear_model_ui"))
+              )
           ),
           box(uiOutput("box_paths_title_ui"), status = "danger", solidHeader = TRUE, width = 6,
               uiOutput("paths_hint_ui"),
@@ -908,8 +1238,14 @@ ui <- dashboardPage(
               )
           )
         )
+      ),
+
+      # ── TAMAÑO DE MUESTRA / SAMPLE SIZE ──────────────────────────────────
+      tabItem(tabName = "sample",
+        uiOutput("sample_size_ui")
       )
-    ),
+
+    ), # end tabItems
 
     tags$footer(
       style = "position:fixed;bottom:0;left:0;right:0;padding:6px 16px;background:#1565C0;color:white;font-size:12px;z-index:9999;",
@@ -919,11 +1255,206 @@ ui <- dashboardPage(
   )
 )
 
+
+# ============================================================================
+# MÓDULO: TAMAÑO DE MUESTRA / SAMPLE SIZE  (CANCHARI PLS-SEM PRO)
+# ============================================================================
+
+# ── Helper functions ─────────────────────────────────────────────────────────
+
+#' Detect max number of predictors pointing to any endogenous construct
+detect_max_predictors <- function(paths_df) {
+  if (is.null(paths_df) || nrow(paths_df) == 0) return(1L)
+  if (!all(c("from","to") %in% names(paths_df))) {
+    # Try generic column names
+    if (ncol(paths_df) >= 2) {
+      paths_df <- setNames(paths_df[,1:2], c("from","to"))
+    } else return(1L)
+  }
+  tbl <- table(paths_df$to)
+  if (length(tbl) == 0) return(1L)
+  as.integer(max(tbl))
+}
+
+#' Power analysis for PLS-SEM via pwr package (Cohen 1988 / Hair et al. 2022)
+#' Uses pwr.f2.test: multiple regression approximation
+#' @param u   number of predictors (max arrows into any endogenous construct)
+#' @param f2  Cohen's f² effect size
+#' @param alpha significance level
+#' @param power statistical power (1-β)
+#' @return list with n_min, n_target, details
+calculate_pls_power_n <- function(u, f2 = 0.15, alpha = 0.05, power = 0.80, margin = 0.15) {
+  has_pwr <- requireNamespace("pwr", quietly = TRUE)
+  if (has_pwr) {
+    res <- pwr::pwr.f2.test(u = u, f2 = f2, sig.level = alpha, power = power)
+    v   <- ceiling(res$v)            # denominator df
+    n   <- v + u + 1                 # total N
+  } else {
+    # Fallback: Green (1991) formula  N >= 50 + 8m
+    n <- max(50 + 8 * u, ceiling((1.96 + qnorm(power))^2 * (1 + f2) / f2) + u + 1)
+  }
+  n_min    <- max(n, 10L)
+  n_target <- ceiling(n_min * (1 + margin))
+  list(
+    n_min    = n_min,
+    n_target = n_target,
+    u        = u,
+    f2       = f2,
+    alpha    = alpha,
+    power    = power,
+    margin   = margin,
+    method   = if(has_pwr) "pwr::pwr.f2.test" else "Green (1991) approximation"
+  )
+}
+
+#' Classical sample size (Cochran formula)
+#' For unknown/large population: n = z² * p * q / e²
+#' For finite population: n_adj = n / (1 + (n-1)/N)
+calculate_classical_sample_size <- function(pop_type = "large", N_pop = NULL,
+                                             conf = 0.95, error = 0.05, p = 0.5) {
+  z <- qnorm(1 - (1 - conf) / 2)
+  q <- 1 - p
+  n_inf <- ceiling(z^2 * p * q / error^2)
+  if (pop_type == "finite" && !is.null(N_pop) && is.numeric(N_pop) && N_pop > 0) {
+    n_adj <- ceiling(n_inf / (1 + (n_inf - 1) / N_pop))
+    list(n = n_adj, n_infinite = n_inf, pop_type = "finite", N_pop = N_pop,
+         conf = conf, error = error, p = p)
+  } else {
+    list(n = n_inf, n_infinite = n_inf, pop_type = "large", N_pop = NULL,
+         conf = conf, error = error, p = p)
+  }
+}
+
+#' Classify sample strength for PLS-SEM
+classify_sample_strength <- function(n_real, n_power) {
+  if (is.na(n_real) || n_real <= 0) return(list(label="Sin dato", color="secondary", icon="❓"))
+  if (n_real < n_power)     return(list(label="⚠ Insuficiente",  color="danger",  icon="🔴"))
+  if (n_real < 100)         return(list(label="✓ Aceptable mín.", color="warning", icon="🟡"))
+  if (n_real < 200)         return(list(label="✓ Adecuado",       color="info",    icon="🔵"))
+  if (n_real < 384)         return(list(label="✓ Robusto",        color="success", icon="🟢"))
+  if (n_real < 500)         return(list(label="✓✓ Excelente",     color="success", icon="🟢"))
+  return(list(label="✓✓✓ Muy Robusto", color="success", icon="🟢"))
+}
+
+#' Smart message based on sample assessment
+sample_smart_message <- function(n_real, n_power, lang = "es") {
+  if (is.na(n_real) || n_real <= 0) return("")
+  es <- lang == "es"
+  if (n_real < n_power) {
+    if(es) paste0("⚠ Su muestra actual (n = ", n_real, ") es INSUFICIENTE para el nivel de potencia requerido (n mín = ", n_power, "). ",
+                  "Se recomienda ampliar la muestra antes de proceder con el análisis PLS-SEM.")
+    else   paste0("⚠ Your current sample (n = ", n_real, ") is INSUFFICIENT for the required power level (n min = ", n_power, "). ",
+                  "Expanding the sample before PLS-SEM analysis is strongly recommended.")
+  } else if (n_real < 100) {
+    if(es) paste0("Su muestra (n = ", n_real, ") supera el mínimo por análisis de potencia pero está por debajo de 100 casos. ",
+                  "Se recomienda aumentar la muestra para mejorar la precisión del bootstrapping y la estabilidad del modelo.")
+    else   paste0("Your sample (n = ", n_real, ") exceeds the power analysis minimum but is below 100 cases. ",
+                  "Increasing the sample is recommended to improve bootstrapping precision and model stability.")
+  } else if (n_real < 200) {
+    if(es) paste0("✓ Su muestra (n = ", n_real, ") es adecuada para el análisis PLS-SEM. ",
+                  "Para análisis de mediación o efectos indirectos, una muestra ≥ 200 aumenta la robustez.")
+    else   paste0("✓ Your sample (n = ", n_real, ") is adequate for PLS-SEM analysis. ",
+                  "For mediation or indirect effects analysis, n ≥ 200 increases robustness.")
+  } else if (n_real < 384) {
+    if(es) paste0("✓ Su muestra (n = ", n_real, ") es robusta para PLS-SEM y adecuada para análisis de mediación secuencial.")
+    else   paste0("✓ Your sample (n = ", n_real, ") is robust for PLS-SEM and suitable for sequential mediation analysis.")
+  } else {
+    if(es) paste0("✓✓ Su muestra (n = ", n_real, ") es excelente. Supera el criterio de potencia estadística y el umbral poblacional clásico (384), ",
+                  "lo que proporciona respaldo metodológico dual.")
+    else   paste0("✓✓ Your sample (n = ", n_real, ") is excellent. It exceeds the power analysis threshold and the classical population criterion (n=384), ",
+                  "providing dual methodological support.")
+  }
+}
+
+#' Generate academic report in Spanish
+generate_sample_size_report_es <- function(pw, cl = NULL, model_detail = "") {
+  f2_label <- switch(as.character(pw$f2),
+    "0.02" = "pequeño (f² = 0.02)",
+    "0.15" = "mediano (f² = 0.15)",
+    "0.35" = "grande (f² = 0.35)",
+    paste0("f² = ", pw$f2)
+  )
+  txt <- paste0(
+    "Se realizó un análisis de potencia estadística para modelos PLS-SEM siguiendo las recomendaciones de ",
+    "Hair et al. (2022), considerando un tamaño de efecto ", f2_label, ", un nivel de significancia de ",
+    pw$alpha, ", una potencia estadística de ", pw$power, " y un máximo de ", pw$u,
+    " predictor(es) apuntando hacia un constructo endógeno", if(nzchar(model_detail)) paste0(" (", model_detail, ")") else "", ". ",
+    "El análisis indicó un tamaño mínimo de muestra de ", pw$n_min, " casos. ",
+    "Considerando un margen adicional del ", round(pw$margin * 100), "% por posibles pérdidas o depuración de datos, ",
+    "el tamaño objetivo se estableció en ", pw$n_target, " participantes. ",
+    "No obstante, por criterios de robustez metodológica en PLS-SEM — especialmente para el análisis de efectos indirectos ",
+    "mediante bootstrapping — se recomienda trabajar con muestras superiores al mínimo estimado."
+  )
+  if (!is.null(cl)) {
+    txt <- paste0(txt, "\n\nAdicionalmente, bajo el supuesto de población ",
+      if(cl$pop_type == "finite") paste0("finita (N = ", cl$N_pop, ")") else "grande",
+      " y un nivel de confianza del ", round(cl$conf * 100), "% con un margen de error del ",
+      round(cl$error * 100), "%, el tamaño mínimo de muestra estimado mediante la fórmula clásica de Cochran fue de ",
+      cl$n, " participantes. En consecuencia, se recomienda que el investigador considere tanto la potencia estadística ",
+      "del modelo como la lógica del diseño muestral en función del contexto del estudio.")
+  }
+  txt
+}
+
+#' Generate academic report in English
+generate_sample_size_report_en <- function(pw, cl = NULL, model_detail = "") {
+  f2_label <- switch(as.character(pw$f2),
+    "0.02" = "small (f² = 0.02)",
+    "0.15" = "medium (f² = 0.15)",
+    "0.35" = "large (f² = 0.35)",
+    paste0("f² = ", pw$f2)
+  )
+  txt <- paste0(
+    "A statistical power analysis for PLS-SEM was conducted following Hair et al. (2022), ",
+    "assuming a ", f2_label, " effect size, a significance level of ", pw$alpha,
+    ", a statistical power of ", pw$power, ", and a maximum of ", pw$u,
+    " predictor(s) pointing to an endogenous construct",
+    if(nzchar(model_detail)) paste0(" (", model_detail, ")") else "", ". ",
+    "The analysis indicated a minimum sample size of ", pw$n_min, " cases. ",
+    "After adding a ", round(pw$margin * 100), "% margin for possible data loss or case exclusion, ",
+    "the target sample size was set at ", pw$n_target, " participants. ",
+    "However, for robustness purposes in PLS-SEM — particularly for indirect effects assessment ",
+    "via bootstrapping — a sample size exceeding the estimated minimum is recommended."
+  )
+  if (!is.null(cl)) {
+    txt <- paste0(txt, "\n\nAdditionally, assuming a ",
+      if(cl$pop_type == "finite") paste0("finite population (N = ", cl$N_pop, ")") else "large population",
+      " with a confidence level of ", round(cl$conf * 100), "% and a margin of error of ",
+      round(cl$error * 100), "%, the minimum sample size estimated via the classical Cochran formula was ",
+      cl$n, " participants. Accordingly, researchers are advised to consider both the statistical power ",
+      "of the model and the logic of the sampling design in the context of their study.")
+  }
+  txt
+}
+
+# ============================================================================
+# SERVER: Sample Size Module
+# ============================================================================
+
+# (This block is appended into server function below via output$sample_size_ui)
+
+
 # ============================================================================
 # SERVER
 # ============================================================================
 
 server <- function(input, output, session) {
+  # Helper: leer items de constructo i desde pickerInput o textInput segun disponibilidad
+  get_items_str <- function(i) {
+    tryCatch({
+      picker_val <- input[[paste0("c_picker_", i)]]
+      text_val   <- input[[paste0("c_items_",  i)]]
+      if (!is.null(picker_val) && is.character(picker_val) && length(picker_val) > 0 && any(nzchar(picker_val))) {
+        paste(trimws(picker_val), collapse = ",")
+      } else if (!is.null(text_val) && nzchar(trimws(text_val %||% ""))) {
+        trimws(text_val)
+      } else {
+        ""
+      }
+    }, error = function(e) "")
+  }
+
+
 
   data_raw       <- reactiveVal(NULL)
   results        <- reactiveValues(tables = list(), log = "► Listo. Cargue datos para comenzar.", pls_est = NULL, dot_code = NULL)
@@ -942,6 +1473,7 @@ server <- function(input, output, session) {
       menu_analysis  = if(es) "⚡ Análisis"        else "⚡ Analysis",
       menu_results   = if(es) "📈 Resultados"     else "📈 Results",
       menu_download  = if(es) "💾 Descargar"      else "💾 Download",
+      menu_sample    = if(es) "🎯 Tamaño Muestra" else "🎯 Sample Size",
       # Project tab
       box_project    = if(es) "🗂 Crear / Abrir Proyecto"  else "🗂 Create / Open Project",
       lbl_proj_name  = if(es) "Nombre del proyecto"        else "Project name",
@@ -982,6 +1514,7 @@ server <- function(input, output, session) {
       lbl_omit       = if(es) "Distancia omisión (Q²/Blindfolding)" else "Omission Distance (Q²/Blindfolding)",
       lbl_calc_q2    = if(es) "Calcular Q² (Blindfolding)"  else "Calculate Q² (Blindfolding)",
       lbl_calc_f2    = if(es) "Calcular f² (Effect Size)"   else "Calculate f² (Effect Size)",
+      lbl_hoc_x2     = if(es) "🔺 [SOLO variable dicotómica] Ajuste HOC × 2 — NO usar con escalas Likert" else "🔺 [ONLY for dichotomous variable] HOC × 2 adjustment — Do NOT use with Likert scales",
       lbl_groups     = if(es) "👥 Grupos (MICOM / MGA)"     else "👥 Groups (MICOM / MGA)",
       lbl_group_var  = if(es) "Variable de grupo (categórica)" else "Group variable (categorical)",
       hint_group_var = if(es) "⚠ Use solo variables con pocas categorías (ej: género, sede, nivel). NO usar variables numéricas continuas."
@@ -1019,6 +1552,15 @@ server <- function(input, output, session) {
       hint_f2          = if(es) "Criterio: pequeño≥0.02, mediano≥0.15, grande≥0.35" else "Criterion: small≥0.02, medium≥0.15, large≥0.35",
       box_vif          = if(es) "VIF (Colinealidad)"   else "VIF (Collinearity)",
       hint_vif         = if(es) "Criterio: VIF < 5 (estricto: < 3.3)" else "Criterion: VIF < 5 (strict: < 3.3)",
+      # ── VIF extendido ──────────────────────────────────────────────────────
+      box_vif_struct   = if(es) "VIF Estructural (Modelo Interno)" else "Structural VIF (Inner Model)",
+      hint_vif_struct  = if(es) "Colinealidad del modelo estructural (Hair et al., 2022). Criterio estricto: VIF < 3.3"
+                         else   "Structural model collinearity (Hair et al., 2022). Strict criterion: VIF < 3.3",
+      box_vif_full     = if(es) "VIF Colinealidad Total (Sesgo de Método Común)" else "Full Collinearity VIF (Common Method Bias)",
+      hint_vif_full    = if(es) "Evaluación completa de colinealidad — Kock (2015). Cada variable latente se regresa sobre todas las demás simultáneamente."
+                         else   "Full collinearity assessment — Kock (2015). Each latent variable is regressed on all others simultaneously.",
+      note_vif_full    = if(es) "Valores de VIF inferiores a 3.3 sugieren ausencia de sesgo de método común."
+                         else   "VIF values below 3.3 suggest absence of common method bias.",
       # Discriminant boxes
       box_htmt         = if(es) "HTMT (Heterotrait-Monotrait Ratio)"   else "HTMT (Heterotrait-Monotrait Ratio)",
       box_fl           = "Fornell-Larcker Criterion",
@@ -1101,6 +1643,7 @@ server <- function(input, output, session) {
   output$sidebar_menu_ui <- renderUI({
     t <- i18n()
     sidebarMenu(id = "sidebar_inner",
+      menuItem(t$menu_sample,   tabName = "sample",   icon = icon("calculator")),
       menuItem(t$menu_project,  tabName = "project",  icon = icon("folder-open")),
       menuItem(t$menu_upload,   tabName = "upload",   icon = icon("upload")),
       menuItem(t$menu_model,    tabName = "model",    icon = icon("sitemap")),
@@ -1154,6 +1697,12 @@ server <- function(input, output, session) {
   output$add_construct_ui <- renderUI({
     actionButton("add_construct", i18n()$btn_add_con, class="btn btn-primary")
   })
+  output$clear_model_ui <- renderUI({
+    es <- input$app_lang != "en"
+    actionButton("clear_model",
+      if(es) "🗑 Limpiar Modelo" else "🗑 Clear Model",
+      class = "btn btn-warning btn-block")
+  })
   output$add_path_ui <- renderUI({
     actionButton("add_path", i18n()$btn_add_path, class="btn btn-danger")
   })
@@ -1171,6 +1720,7 @@ server <- function(input, output, session) {
       numericInput("omission_distance", t$lbl_omit, value = isolate(input$omission_distance) %||% 7, min = 5, max = 15),
       checkboxInput("calc_q2", t$lbl_calc_q2, value = isolate(input$calc_q2) %||% TRUE),
       checkboxInput("calc_f2", t$lbl_calc_f2, value = isolate(input$calc_f2) %||% TRUE),
+      checkboxInput("hoc_x2",  t$lbl_hoc_x2,  value = isolate(input$hoc_x2)  %||% FALSE),
       tags$h5(t$lbl_groups),
       selectInput("group_var", t$lbl_group_var, choices = c(""), selected = ""),
       tags$small(tags$i(t$hint_group_var)),
@@ -1217,6 +1767,36 @@ server <- function(input, output, session) {
               tags$small(t$hint_f2), br(), br(), DTOutput("table_f2")),
           box(title = t$box_vif, status = "primary", solidHeader = TRUE, width = 6,
               tags$small(t$hint_vif), br(), br(), DTOutput("table_vif"))
+        ),
+        # ── VIF Estructural (Hair et al., 2022) ─────────────────────────────
+        fluidRow(
+          box(
+            title = t$box_vif_struct, status = "primary", solidHeader = TRUE, width = 12,
+            tags$div(
+              style = "background:#E3F2FD; border-left:4px solid #1565C0; padding:10px; border-radius:4px; margin-bottom:12px;",
+              tags$b("Hair et al. (2022). "),
+              tags$span(t$hint_vif_struct)
+            ),
+            DTOutput("table_vif_structural")
+          )
+        ),
+        # ── VIF Colinealidad Total / CMB (Kock, 2015) ───────────────────────
+        fluidRow(
+          box(
+            title = t$box_vif_full, status = "warning", solidHeader = TRUE, width = 12,
+            tags$div(
+              style = "background:#FFF8E1; border-left:4px solid #F9A825; padding:10px; border-radius:4px; margin-bottom:12px;",
+              tags$b("Kock (2015). "),
+              tags$span(t$hint_vif_full)
+            ),
+            DTOutput("table_vif_full"),
+            br(),
+            tags$div(
+              style = "background:#F1F8E9; border-left:4px solid #558B2F; padding:8px 12px; border-radius:4px; margin-top:10px;",
+              tags$i(class = "fa fa-info-circle", style = "color:#558B2F; margin-right:6px;"),
+              tags$span(style = "color:#33691E; font-size:13px;", uiOutput("vif_full_note_ui"))
+            )
+          )
         )
       ),
       tabPanel(t$tab_discriminant, br(),
@@ -1281,6 +1861,116 @@ server <- function(input, output, session) {
         )),
         fluidRow(box(title = t$mga_betas, status = "primary", solidHeader = FALSE, width = 12,
             uiOutput("mga_summary_ui")))
+      ),
+      tabPanel("🧪 Robustness Analysis", br(),
+
+        # ── Control row: scoring toggle + Run button ────────────────────────
+        fluidRow(
+          box(title = "Gaussian Copula Endogeneity Test \u2014 Park & Gupta (2012)",
+              status = "info", solidHeader = TRUE, width = 12,
+
+              # Method info banner
+              tags$div(style = "background:#E3F2FD;border-left:4px solid #1565C0;padding:10px;border-radius:4px;margin-bottom:12px;",
+                tags$b("\U0001f4d6 M\u00e9todo / Method:"),
+                tags$small(" Gaussian Copula test following Park & Gupta (2012) for detection of potential endogeneity in cross-sectional predictive models."),
+                br(),
+                tags$b("\U0001f50d Criterion:"),
+                tags$small(" p < 0.05 \u2192 Potential endogeneity detected | p \u2265 0.05 \u2192 No evidence of endogeneity"),
+                br(),
+                tags$b("\U0001f4da Reference:"),
+                tags$small(" Park, S. & Gupta, S. (2012). Handling Endogeneity in Marketing Models Using Copulas. Marketing Science, 31(2), 317\u2013333.")
+              ),
+
+              # Scoring method toggle
+              fluidRow(
+                column(6,
+                  checkboxInput("copula_use_mean_scores",
+                    "\U0001f4ca Use composite mean scores instead of PLS latent scores",
+                    value = FALSE)
+                ),
+                column(6,
+                  actionButton("run_copula_test", "\u25b6 Run Gaussian Copula Test",
+                               class = "btn btn-info btn-lg",
+                               style = "width:100%;")
+                )
+              ),
+              br(),
+              uiOutput("copula_status_ui"),
+              br(),
+
+              # Technical Details box (shown after run)
+              uiOutput("copula_tech_details_ui"),
+              br(),
+
+              # Results table
+              DTOutput("table_copula"),
+              br(),
+              fluidRow(
+                column(2, downloadButton("dl_copula_csv",   "\u2b07 CSV",           class = "btn btn-sm btn-default btn-block")),
+                column(3, downloadButton("dl_copula_excel", "\u2b07 Excel (.xlsx)", class = "btn btn-sm btn-success btn-block")),
+                column(3, downloadButton("dl_copula_word",  "\u2b07 Word (.docx)",  class = "btn btn-sm btn-warning btn-block")),
+                column(2, downloadButton("dl_copula_pdf",   "\u2b07 PDF",           class = "btn btn-sm btn-danger btn-block"))
+              )
+          )
+        ),
+
+        # ── Two-plot sub-tabs ────────────────────────────────────────────────
+        fluidRow(
+          box(title = "Plots", status = "primary", solidHeader = TRUE, width = 12,
+            tabsetPanel(id = "copula_plot_tabs",
+
+              # ── Plot A: Forest / Dot-and-Whisker ──────────────────────────
+              tabPanel("\U0001f4ca Results Plot (Forest)", br(),
+                tags$small(style = "color:#555;",
+                  "Publication-ready forest plot: Copula coefficient (\u25cf) with 95% CI per structural path. ",
+                  "\u25c7 = PLS bootstrapped \u03b2 (reference only). Red = p < 0.05."
+                ),
+                br(), br(),
+                plotOutput("plot_copula_forest", height = "460px"),
+                br(),
+                fluidRow(
+                  column(3, downloadButton("dl_forest_png", "\u2b07 PNG (300 dpi)", class = "btn btn-sm btn-primary btn-block")),
+                  column(3, downloadButton("dl_forest_pdf", "\u2b07 PDF (vector)",  class = "btn btn-sm btn-danger btn-block")),
+                  column(3, downloadButton("dl_forest_svg", "\u2b07 SVG",           class = "btn btn-sm btn-default btn-block"))
+                )
+              ),
+
+              # ── Plot B: Copula Visualization ──────────────────────────────
+              tabPanel("\U0001f52c Copula Visualization (Optional)", br(),
+                tags$small(style = "color:#555;",
+                  "Visualize the rank-normal transformed variables (z_X, z_Y) used in the copula procedure. ",
+                  "Select a path and view type below."
+                ),
+                br(), br(),
+                fluidRow(
+                  column(4,
+                    uiOutput("copula_viz_path_selector_ui")
+                  ),
+                  column(4,
+                    radioButtons("copula_viz_type", "View type:",
+                      choices  = c("Scatter + density overlay" = "scatter",
+                                   "2D density / contour"      = "contour"),
+                      selected = "scatter", inline = TRUE)
+                  ),
+                  column(4,
+                    uiOutput("copula_viz_n_ui")
+                  )
+                ),
+                br(),
+                plotOutput("plot_copula_viz", height = "480px"),
+                br(),
+                tags$small(style = "color:#777; font-style:italic;",
+                  "This visualization displays the rank-normal transformed variables (z_X, z_Y) used for copula-based diagnostics."),
+                br(), br(),
+                fluidRow(
+                  column(3, downloadButton("dl_viz_png", "\u2b07 PNG (300 dpi)", class = "btn btn-sm btn-primary btn-block")),
+                  column(3, downloadButton("dl_viz_pdf", "\u2b07 PDF (vector)",  class = "btn btn-sm btn-danger btn-block")),
+                  column(3, downloadButton("dl_viz_svg", "\u2b07 SVG",           class = "btn btn-sm btn-default btn-block"))
+                )
+              )
+            )
+          )
+        )
       )
     )
   })
@@ -1309,7 +1999,7 @@ observe({
     if (is.null(nm1)) return()
     mdl_tmp <- list(
       constructs = lapply(seq_len(construct_count()), function(i)
-        list(name = input[[paste0("c_name_", i)]], items_str = input[[paste0("c_items_", i)]])),
+        list(name = input[[paste0("c_name_", i)]], items_str = get_items_str(i))),
       paths = data.frame(
         from = sapply(seq_len(path_count()), function(i) input[[paste0("p_from_", i)]] %||% ""),
         to   = sapply(seq_len(path_count()), function(i) input[[paste0("p_to_",   i)]] %||% ""),
@@ -1399,20 +2089,86 @@ observe({
   # ── CONSTRUCTOS (UI dinámica) ─────────────────────────────────────────────
   construct_count <- reactiveVal(4)
   output$construct_inputs <- renderUI({
-    t   <- i18n()
-    cnt <- construct_count()  # dependencia reactiva: recrea inputs al cambiar cantidad
-    mdl <- isolate(last_model())  # isolate: no se re-ejecuta cuando last_model cambia solo
+    t    <- i18n()
+    es   <- isTRUE(input$app_lang != "en")
+    cnt  <- construct_count()
+    mdl  <- isolate(last_model())
+
+    # Obtener columnas disponibles de forma segura
+    cols <- character(0)
+    df_tmp <- tryCatch(data_raw(), error = function(e) NULL)
+    if (!is.null(df_tmp) && is.data.frame(df_tmp) && ncol(df_tmp) > 0) {
+      nms  <- names(df_tmp)
+      keep <- vapply(nms, function(cn) {
+        x <- df_tmp[[cn]]
+        if (is.numeric(x)) return(TRUE)
+        suppressWarnings(sum(!is.na(as.numeric(as.character(x)))) >= 3)
+      }, logical(1))
+      cols <- nms[keep]
+    }
+
     lapply(1:cnt, function(i) {
       pre_name  <- if (!is.null(mdl) && i <= length(mdl$constructs)) mdl$constructs[[i]]$name      %||% "" else ""
       pre_items <- if (!is.null(mdl) && i <= length(mdl$constructs)) mdl$constructs[[i]]$items_str %||% "" else ""
-      fluidRow(
-        column(1, tags$div(style="padding-top:28px; text-align:center; font-weight:bold; color:#1565C0;", paste0("C",i))),
-        column(4, textInput(paste0("c_name_",i),  t$lbl_c_name,  value = pre_name)),
-        column(7, textInput(paste0("c_items_",i), t$lbl_c_items, value = pre_items))
+      pre_selected <- if (nzchar(pre_items)) trimws(unlist(strsplit(pre_items, ","))) else character(0)
+      pre_selected <- pre_selected[pre_selected %in% cols]
+
+      fluidRow(style = "margin-bottom:8px;",
+        column(1, tags$div(style="padding-top:28px; text-align:center; font-weight:bold; color:#1565C0; font-size:16px;", paste0("C",i))),
+        column(3, textInput(paste0("c_name_",i), t$lbl_c_name, value = pre_name)),
+        column(8,
+          if (length(cols) > 0) {
+            pickerInput(
+              inputId  = paste0("c_picker_", i),
+              label    = if (es) "Ítems de este constructo:" else "Items for this construct:",
+              choices  = cols,
+              selected = pre_selected,
+              multiple = TRUE,
+              options  = list(
+                `actions-box`          = TRUE,
+                `live-search`          = TRUE,
+                `live-search-placeholder` = if (es) "Buscar ítem..." else "Search item...",
+                `selected-text-format` = "count > 3",
+                `count-selected-text`  = if (es) "{0} ítems seleccionados" else "{0} items selected",
+                `select-all-text`      = if (es) "Seleccionar todos" else "Select All",
+                `deselect-all-text`    = if (es) "Deseleccionar todos" else "Deselect All",
+                `none-selected-text`   = if (es) "Sin selección" else "Nothing selected",
+                size                   = 8
+              ),
+              width = "100%"
+            )
+          } else {
+            tagList(
+              textInput(paste0("c_items_", i), t$lbl_c_items, value = pre_items),
+              tags$small(style="color:#f59e0b;", "⚠️ Carga tus datos primero para ver el selector de ítems")
+            )
+          }
+        )
       )
     })
   })
   observeEvent(input$add_construct, { construct_count(construct_count() + 1) })
+
+  # ── LIMPIAR MODELO ────────────────────────────────────────────────────────
+  observeEvent(input$clear_model, {
+    tryCatch(if (file.exists(model_store_file)) file.remove(model_store_file), error = function(e) NULL)
+    last_model(NULL)
+    construct_count(4)
+    path_count(3)
+    for (i in 1:10) {
+      tryCatch(updateTextInput(session, paste0("c_name_",  i), value = ""), error = function(e) NULL)
+      tryCatch(updateTextInput(session, paste0("c_items_", i), value = ""), error = function(e) NULL)
+      tryCatch(
+        updatePickerInput(session, paste0("c_picker_", i), selected = character(0)),
+        error = function(e) NULL
+      )
+    }
+    for (i in 1:10) {
+      tryCatch(updateTextInput(session, paste0("p_from_", i), value = ""), error = function(e) NULL)
+      tryCatch(updateTextInput(session, paste0("p_to_",   i), value = ""), error = function(e) NULL)
+    }
+    output$validation_output <- renderText("")
+  })
 
   # ── RELACIONES (UI dinámica) ──────────────────────────────────────────────
   path_count <- reactiveVal(3)
@@ -1520,15 +2276,45 @@ observe({
 
     for (i in 1:construct_count()) {
       nm <- trimws(input[[paste0("c_name_",i)]] %||% "")
-      it <- trimws(input[[paste0("c_items_",i)]] %||% "")
+      it <- get_items_str(i)
       if (!nzchar(nm) || !nzchar(it)) next
-      items <- if (!is.null(df)) parse_item_range(it, names(df)) else strsplit(it,",")[[1]]
-      if (length(items) == 0)
-        msg <- c(msg, sprintf(t$val_no_items, nm))
-      else if (length(items) < 2)
-        msg <- c(msg, sprintf(t$val_one_item, nm))
-      else
-        msg <- c(msg, sprintf(t$val_ok, nm, length(items), paste(items,collapse=", ")))
+
+      # ── Detectar si es HOC (sintaxis C1+C2) ──────────────────────────────
+      is_hoc <- FALSE
+      if (grepl("[+|]", it)) {
+        parts <- trimws(unlist(strsplit(it, "[+|]")))
+        parts <- parts[nzchar(parts)]
+        # Recolectar todos los nombres de constructos definidos
+        all_defined_names <- sapply(1:construct_count(), function(j) {
+          trimws(input[[paste0("c_name_", j)]] %||% "")
+        })
+        if (length(parts) >= 2 && all(parts %in% all_defined_names)) {
+          is_hoc <- TRUE
+          msg <- c(msg, paste0("✓ Constructo '", nm, "': HOC de 2° orden [", paste(parts, collapse=" + "), "]"))
+        }
+      }
+
+      if (!is_hoc) {
+        items <- if (!is.null(df)) parse_item_range(it, names(df)) else strsplit(it,",")[[1]]
+        if (length(items) == 0) {
+          # Verificar si quizás el usuario olvidó definir los sub-constructos (typo)
+          parts_check <- trimws(unlist(strsplit(it, "[+|,]")))
+          parts_check <- parts_check[nzchar(parts_check)]
+          all_defined_check <- sapply(1:construct_count(), function(j) {
+            trimws(input[[paste0("c_name_", j)]] %||% "")
+          })
+          if (length(parts_check) >= 2 && all(parts_check %in% all_defined_check)) {
+            # Es HOC pero no fue detectado por el detector principal (caso edge)
+            msg <- c(msg, paste0("✓ Constructo '", nm, "': HOC de 2° orden [", paste(parts_check, collapse=" + "), "]"))
+          } else {
+            msg <- c(msg, sprintf(t$val_no_items, nm))
+          }
+        }
+        else if (length(items) < 2)
+          msg <- c(msg, sprintf(t$val_one_item, nm))
+        else
+          msg <- c(msg, sprintf(t$val_ok, nm, length(items), paste(items,collapse=", ")))
+      }
     }
 
     for (i in 1:path_count()) {
@@ -1559,7 +2345,7 @@ observe({
       def_map <- list()
       for (i in 1:construct_count()) {
         nm <- trimws(input[[paste0("c_name_",i)]] %||% "")
-        it <- trimws(input[[paste0("c_items_",i)]] %||% "")
+        it <- get_items_str(i)
         if (nzchar(nm) && nzchar(it)) def_map[[nm]] <- it
       }
       req(length(def_map) > 0)
@@ -1577,13 +2363,115 @@ observe({
         parse_item_range(it_str, names(data_raw()))
       }
 
+      # ── Detectar HOC (sintaxis C1+C2) ────────────────────────────────────────
+      hoc_specs <- list()
+      for (nm in names(def_map)) {
+        it_str <- def_map[[nm]]
+        if (grepl("[+|]", it_str)) {
+          parts <- trimws(unlist(strsplit(it_str, "[+|]")))
+          parts <- parts[nzchar(parts)]
+          if (length(parts) >= 2 && all(parts %in% names(def_map)))
+            hoc_specs[[nm]] <- parts
+        }
+      }
+
+      # ── LOC de primer orden ───────────────────────────────────────────────────
       c_list <- list()
       construct_items_map <- list()
       for (nm in names(def_map)) {
-        items <- resolve_items(def_map[[nm]])
+        if (nm %in% names(hoc_specs)) next
+        items <- parse_item_range(def_map[[nm]], names(data_raw()))
         if (!is.null(items) && length(items) > 0) {
           c_list[[length(c_list)+1]] <- composite(nm, items)
           construct_items_map[[nm]] <- items
+        }
+      }
+
+      # ── HOC: Two-Stage Approach (Hair et al. 2022 / SmartPLS equivalent) ────────
+      # Stage 1: estimar PLS COMPLETO con todos los LOC → extraer construct scores PLS reales
+      # Stage 2: usar esos scores como ítems del HOC en el modelo principal
+      # Esto replica exactamente el procedimiento de SmartPLS para variables de 2° orden.
+      hoc_data <- as.data.frame(data_raw())
+
+      if (length(hoc_specs) > 0) {
+        # ── Stage 1: modelo SATURADO con TODOS los LOC ───────────────────────────────
+        # Igual que SmartPLS: estima todos los constructos de primer orden juntos
+        # con un modelo saturado (todas las rutas posibles entre LOC).
+        # Esto garantiza que los construct scores de CV, BL, ML etc. capturan
+        # toda la covarianza del sistema antes de usarlos como indicadores del HOC.
+        all_loc_names_s1 <- names(construct_items_map)[!names(construct_items_map) %in% names(hoc_specs)]
+
+        c_list_stage1 <- list()
+        for (nm in all_loc_names_s1) {
+          items_nm <- construct_items_map[[nm]]
+          items_nm <- items_nm[items_nm %in% names(hoc_data)]
+          if (length(items_nm) >= 1)
+            c_list_stage1[[length(c_list_stage1)+1]] <- composite(nm, items_nm)
+        }
+
+        # Modelo saturado: cada LOC conectado con todos los demás LOC
+        p_list_s1 <- list(); p_added_s1 <- character(0)
+        for (fi in seq_along(all_loc_names_s1)) {
+          for (ti in seq_along(all_loc_names_s1)) {
+            if (fi == ti) next
+            f_nm <- all_loc_names_s1[fi]; t_nm <- all_loc_names_s1[ti]
+            k_s1 <- paste0(f_nm, "->", t_nm)
+            if (!(k_s1 %in% p_added_s1)) {
+              p_list_s1[[length(p_list_s1)+1]] <- paths(from=f_nm, to=t_nm)
+              p_added_s1 <- c(p_added_s1, k_s1)
+            }
+          }
+        }
+
+        stage1_scores <- NULL
+        if (length(c_list_stage1) >= 2 && length(p_list_s1) >= 1) {
+          stage1_scores <- tryCatch({
+            m_s1 <- do.call(constructs, c_list_stage1)
+            s_s1 <- do.call(relationships, p_list_s1)
+            pls_s1 <- estimate_pls(data = hoc_data,
+                                   measurement_model = m_s1,
+                                   structural_model  = s_s1)
+            sc <- as.data.frame(pls_s1$construct_scores)
+            message("Stage-1 OK. Constructos: ", paste(names(sc), collapse=", "))
+            sc
+          }, error = function(e) {
+            message("Stage-1 PLS error (fallback): ", e$message)
+            NULL
+          })
+        }
+
+        # ── Stage 2: agregar scores PLS del Stage-1 como ítems del HOC ──────────
+        for (hoc_nm in names(hoc_specs)) {
+          locs    <- hoc_specs[[hoc_nm]]
+          locs_ok <- locs[locs %in% names(construct_items_map)]
+          if (length(locs_ok) < 2) next
+
+          score_cols <- c()
+          for (l in locs_ok) {
+            col_nm <- paste0("__hoc_", hoc_nm, "_", l)
+
+            if (!is.null(stage1_scores) && l %in% names(stage1_scores)) {
+              # ✓ Usar construct score PLS real del Stage-1 (idéntico a SmartPLS)
+              hoc_data[[col_nm]] <- as.numeric(stage1_scores[[l]])
+            } else {
+              # Fallback: media de ítems estandarizados (si Stage-1 falló)
+              items_l <- construct_items_map[[l]]
+              items_l <- items_l[items_l %in% names(hoc_data)]
+              if (length(items_l) == 0) next
+              mat <- scale(as.matrix(hoc_data[, items_l, drop = FALSE]))
+              hoc_data[[col_nm]] <- as.numeric(rowMeans(mat, na.rm = TRUE))
+            }
+            score_cols <- c(score_cols, col_nm)
+          }
+
+          if (length(score_cols) >= 2) {
+            # mode_B = reflective at 2nd order (composite of composites) — evita NA en mmMatrix
+            c_list[[length(c_list)+1]] <- composite(hoc_nm, score_cols, mode_B)
+            construct_items_map[[hoc_nm]] <- score_cols
+            stage_src <- if (!is.null(stage1_scores)) "Two-Stage PLS" else "Two-Stage fallback"
+            results$log <- paste0("✓ HOC '", hoc_nm,
+                                  "' [", stage_src, ": ", paste(locs_ok, collapse="+"), "]")
+          }
         }
       }
       req(length(c_list) > 0)
@@ -1608,7 +2496,7 @@ observe({
 
       # ── 3. Estimación PLS ───────────────────────────────────────────────
       results$log <- if(es) "► [2/7] Estimando modelo PLS-SEM..." else "► [2/7] Estimating PLS-SEM model..."
-      pls_est <- estimate_pls(data = data_raw(), measurement_model = m_model, structural_model = s_model)
+      pls_est <- estimate_pls(data = hoc_data, measurement_model = m_model, structural_model = s_model)
       summ    <- summary(pls_est)
       results$pls_est <- pls_est
 
@@ -1806,151 +2694,296 @@ observe({
                  OK   = ifelse(HTMT < 0.85, "✓ <0.85", ifelse(HTMT < 0.90, "⚠ <0.90", "✗ ≥0.90")))
       }
 
-      # ── 9. Bootstrapping ─────────────────────────────────────────────────
+      # ── 9. Bootstrapping ─────────────────────────────────────────────────────
       results$log <- if(es) "► [6/7] Ejecutando Bootstrapping..." else "► [6/7] Running Bootstrapping..."
-      boot_est  <- bootstrap_model(seminr_model = pls_est, nboot = input$nboot, cores = 1, seed = 123)
-      boot_summ <- tryCatch(summary(boot_est), error=function(e) NULL)
-      req(!is.null(boot_summ))
 
-      bp <- tryCatch(as.data.frame(safe_list_get(boot_summ, "bootstrapped_paths")), error=function(e) NULL)
-      req(!is.null(bp))
+      nboot_n   <- as.integer(input$nboot)
+      n_obs     <- nrow(hoc_data)
+      path_keys <- paste0(p_df$from, " -> ", p_df$to)
+      set.seed(123)
 
-      path_lbl <- rownames(bp) %||% paste0("Path_", seq_len(nrow(bp)))
+      # SIN HOC: bootstrap_model() de seminr → rápido, correcto, idéntico a SmartPLS
+      # CON HOC: bootstrap manual con Two-Stage saturado en cada resample
+      if (length(hoc_specs) == 0) {
 
-      beta_v <- get_num_col(bp,
-        exact_names = c("Original","Original estimate","Original_Estimate","original_sample","Original_sample","Estimate","Beta"),
-        regex_pats  = c("original","orig","estimate","beta","sample"))
+        boot_est  <- tryCatch(
+          bootstrap_model(seminr_model = pls_est, nboot = nboot_n, cores = 1, seed = 123),
+          error = function(e) NULL)
+        boot_summ <- if (!is.null(boot_est)) tryCatch(summary(boot_est), error=function(e) NULL) else NULL
+        bp        <- if (!is.null(boot_summ)) tryCatch(as.data.frame(safe_list_get(boot_summ, "bootstrapped_paths")), error=function(e) NULL) else NULL
 
-      se_v <- get_num_col(bp,
-        exact_names = c("Std.Error","Std Error","Std_Error","SE","se","Std.Dev","Std Dev","Std_Dev","SD"),
-        regex_pats  = c("std\\.?\\s*error","stderr","se\\b","std\\.?\\s*dev","stdev","\\bsd\\b"))
+        if (!is.null(bp) && nrow(bp) > 0) {
+          path_lbl <- rownames(bp) %||% paste0("Path_", seq_len(nrow(bp)))
+          beta_v <- get_num_col(bp,
+            exact_names = c("Original","Original estimate","Original_Estimate","original_sample","Original_sample","Estimate","Beta"),
+            regex_pats  = c("original","orig","estimate","beta","sample"))
+          se_v <- get_num_col(bp,
+            exact_names = c("Std.Error","Std Error","Std_Error","SE","se","Std.Dev","Std Dev","Std_Dev","SD"),
+            regex_pats  = c("std\\.?\\s*error","stderr","se\\b","std\\.?\\s*dev","stdev","\\bsd\\b"))
+          ic_lo_v <- rep(NA_real_, nrow(bp)); ic_hi_v <- rep(NA_real_, nrow(bp))
+          known_lo <- c("2.5%","2.5 %","CI_lower","CI_Lower","Lower","lower","LL","Perc_2.5","lower_2.5")
+          known_hi <- c("97.5%","97.5 %","CI_upper","CI_Upper","Upper","upper","UL","Perc_97.5","upper_97.5")
+          bp_nms <- tolower(trimws(names(bp)))
+          for (nm in known_lo) { idx2 <- which(bp_nms==tolower(trimws(nm))); if(length(idx2)){ ic_lo_v <- suppressWarnings(as.numeric(bp[[idx2[1]]])); break } }
+          for (nm in known_hi) { idx2 <- which(bp_nms==tolower(trimws(nm))); if(length(idx2)){ ic_hi_v <- suppressWarnings(as.numeric(bp[[idx2[1]]])); break } }
+          if (all(is.na(ic_lo_v)) && ncol(bp) >= 5) {
+            ni <- which(sapply(bp, function(x) !all(is.na(suppressWarnings(as.numeric(x))))))
+            if (length(ni)>=6){ ic_lo_v <- suppressWarnings(as.numeric(bp[[ni[5]]])); ic_hi_v <- suppressWarnings(as.numeric(bp[[ni[6]]])) }
+            else if (length(ni)==5){ ic_lo_v <- suppressWarnings(as.numeric(bp[[ni[4]]])); ic_hi_v <- suppressWarnings(as.numeric(bp[[ni[5]]])) }
+          }
+        } else {
+          # Fallback sin bootstrap
+          path_lbl <- path_keys
+          pm_fb <- tryCatch(as.matrix(pls_est$path_coef), error=function(e) NULL)
+          beta_v <- sapply(path_keys, function(pk) {
+            pt <- strsplit(pk," -> ")[[1]]
+            if(!is.null(pm_fb) && length(pt)==2 && pt[1]%in%rownames(pm_fb) && pt[2]%in%colnames(pm_fb)) as.numeric(pm_fb[pt[1],pt[2]]) else NA_real_
+          })
+          se_v <- rep(NA_real_, length(path_keys))
+          ic_lo_v <- rep(NA_real_, length(path_keys))
+          ic_hi_v <- rep(NA_real_, length(path_keys))
+        }
 
-      t_v <- get_num_col(bp,
-        exact_names = c("t","T","t-value","t value","t_value","T.Value","T value"),
-        regex_pats  = c("^t$","t[-_ ]?value","t[-_ ]?stat"))
+        STDEV_raw <- suppressWarnings(as.numeric(se_v)); STDEV_raw[STDEV_raw==0] <- NA
+        beta_v    <- suppressWarnings(as.numeric(beta_v))
+        if (all(is.na(ic_lo_v)) || all(is.na(ic_hi_v))) {
+          ic_lo_v <- beta_v - 1.96 * STDEV_raw
+          ic_hi_v <- beta_v + 1.96 * STDEV_raw
+        }
+        boot_summ_out <- boot_summ
 
-      if (all(is.na(t_v)) && !all(is.na(beta_v)) && !all(is.na(se_v)))
-        t_v <- beta_v / se_v
+      } else {
 
-      STDEV_raw <- as.numeric(se_v); STDEV_raw[STDEV_raw == 0] <- NA
-      df_t <- max(nrow(data_raw()) - 1, 1)
+        # ── HOC: bootstrap manual con Two-Stage saturado ─────────────────────────
+        boot_summ_out <- NULL
+
+        run_twostage_pls <- function(dat) {
+          # Mapa de ítems para todos los LOC
+          cim_b <- list()
+          for (nm_b in names(def_map)) {
+            if (nm_b %in% names(hoc_specs)) next
+            its_b <- parse_item_range(def_map[[nm_b]], names(dat))
+            if (length(its_b) > 0) cim_b[[nm_b]] <- its_b
+          }
+          all_loc_b <- names(cim_b)
+          dat_aug <- dat
+
+          # Stage-1: modelo SATURADO con todos los LOC
+          cl_s1 <- Filter(Negate(is.null), lapply(all_loc_b, function(nm_b) {
+            its <- cim_b[[nm_b]][cim_b[[nm_b]] %in% names(dat_aug)]
+            if (length(its) >= 1) composite(nm_b, its) else NULL
+          }))
+          p_s1 <- list(); p_added <- character(0)
+          for (fi in seq_along(all_loc_b)) for (ti in seq_along(all_loc_b)) {
+            if (fi==ti) next
+            k2 <- paste0(all_loc_b[fi],"->",all_loc_b[ti])
+            if (!(k2 %in% p_added)) {
+              p_s1[[length(p_s1)+1]] <- paths(from=all_loc_b[fi], to=all_loc_b[ti])
+              p_added <- c(p_added, k2)
+            }
+          }
+
+          sc_s1 <- NULL
+          if (length(cl_s1) >= 2 && length(p_s1) >= 1)
+            sc_s1 <- tryCatch(
+              as.data.frame(estimate_pls(dat_aug,
+                do.call(constructs, cl_s1),
+                do.call(relationships, p_s1))$construct_scores),
+              error = function(e) NULL)
+
+          # Stage-2: scores como ítems del HOC
+          cl_b <- Filter(Negate(is.null), lapply(all_loc_b, function(nm_b) {
+            its <- cim_b[[nm_b]][cim_b[[nm_b]] %in% names(dat_aug)]
+            if (length(its) >= 1) composite(nm_b, its) else NULL
+          }))
+          for (hoc_n in names(hoc_specs)) {
+            lh <- hoc_specs[[hoc_n]][hoc_specs[[hoc_n]] %in% all_loc_b]
+            if (length(lh) < 2) next
+            sc_cols <- c()
+            for (l_b in lh) {
+              cn_b <- paste0("__hoc_", hoc_n, "_", l_b)
+              if (!is.null(sc_s1) && l_b %in% names(sc_s1)) {
+                dat_aug[[cn_b]] <- as.numeric(sc_s1[[l_b]])
+              } else {
+                its2 <- cim_b[[l_b]][cim_b[[l_b]] %in% names(dat_aug)]
+                if (length(its2) == 0) next
+                dat_aug[[cn_b]] <- as.numeric(rowMeans(
+                  scale(as.matrix(dat_aug[, its2, drop=FALSE])), na.rm=TRUE))
+              }
+              sc_cols <- c(sc_cols, cn_b)
+            }
+            if (length(sc_cols) >= 2)
+              cl_b[[length(cl_b)+1]] <- tryCatch(
+                composite(hoc_n, sc_cols, mode_B),
+                error=function(e) tryCatch(composite(hoc_n, sc_cols), error=function(e2) NULL))
+          }
+
+          cl_b <- Filter(Negate(is.null), cl_b)
+          if (length(cl_b) == 0) return(NULL)
+          pls_b <- tryCatch(estimate_pls(dat_aug, do.call(constructs, cl_b), s_model), error=function(e) NULL)
+          if (is.null(pls_b)) return(NULL)
+          pm_b <- tryCatch(as.matrix(pls_b$path_coef), error=function(e) NULL)
+          if (is.null(pm_b)) return(NULL)
+
+          out_b <- setNames(rep(NA_real_, length(path_keys)), path_keys)
+          for (pk in path_keys) {
+            pt <- strsplit(pk, " -> ")[[1]]
+            if (length(pt)==2 && pt[1]%in%rownames(pm_b) && pt[2]%in%colnames(pm_b))
+              out_b[pk] <- as.numeric(pm_b[pt[1], pt[2]])
+          }
+          out_b
+        }
+
+        # Beta original sobre muestra completa con Two-Stage saturado
+        beta_orig_full <- tryCatch(run_twostage_pls(hoc_data), error=function(e) NULL)
+        message("HOC beta original (Two-Stage saturado): ",
+                paste(names(beta_orig_full), round(beta_orig_full,3), sep="=", collapse=", "))
+
+        # Loop bootstrap
+        boot_matrix <- matrix(NA_real_, nrow=nboot_n, ncol=length(path_keys),
+                              dimnames=list(NULL, path_keys))
+        for (b in seq_len(nboot_n)) {
+          idx_b <- sample(n_obs, n_obs, replace=TRUE)
+          res_b <- tryCatch(run_twostage_pls(hoc_data[idx_b,,drop=FALSE]), error=function(e) NULL)
+          if (!is.null(res_b)) boot_matrix[b,] <- res_b
+          if (b %% max(1L, nboot_n %/% 10L) == 0L)
+            results$log <- paste0("► Bootstrap: ", round(100*b/nboot_n), "% (", b, "/", nboot_n, ")")
+        }
+
+        path_lbl  <- path_keys
+        beta_v    <- if (!is.null(beta_orig_full)) as.numeric(beta_orig_full[path_keys]) else rep(NA_real_, length(path_keys))
+        se_v      <- apply(boot_matrix, 2, function(x) sd(x, na.rm=TRUE))
+        ic_lo_v   <- apply(boot_matrix, 2, function(x) quantile(x, 0.025, na.rm=TRUE))
+        ic_hi_v   <- apply(boot_matrix, 2, function(x) quantile(x, 0.975, na.rm=TRUE))
+        STDEV_raw <- se_v; STDEV_raw[STDEV_raw == 0] <- NA
+
+      }
+
+      df_t  <- max(n_obs - 1, 1)
       T_raw <- beta_v / STDEV_raw
-      p_raw <- 2 * (1 - pt(abs(T_raw), df = df_t))
+      p_raw <- 2 * (1 - pt(abs(T_raw), df=df_t))
 
-      # ── f² por scores latentes ───────────────────────────────────────────
+      # ── f² (usa scores_df del PLS original — sin cambios) ────────────────────
 
       calc_f2_scores <- function(sc, p_df) {
-        if (is.null(sc) || nrow(sc)==0 || is.null(p_df) || nrow(p_df)==0)
-          return(data.frame(Path=character(), f2=numeric()))
-        out <- data.frame(Path=character(), f2=numeric(), stringsAsFactors=FALSE)
+        if (is.null(sc)||nrow(sc)==0||is.null(p_df)||nrow(p_df)==0) return(data.frame(Path=character(),f2=numeric()))
+        out <- data.frame(Path=character(),f2=numeric(),stringsAsFactors=FALSE)
         for (endo in unique(p_df$to)) {
-          preds_all <- unique(p_df$from[p_df$to == endo])
-          preds_all <- preds_all[preds_all %in% names(sc)]
+          preds_all <- unique(p_df$from[p_df$to==endo]); preds_all <- preds_all[preds_all %in% names(sc)]
           if (!(endo %in% names(sc)) || !length(preds_all)) next
-          fml_full  <- as.formula(paste0(endo," ~ ", paste(preds_all, collapse=" + ")))
-          fit_full  <- tryCatch(stats::lm(fml_full, data=sc), error=function(e) NULL)
+          fit_full <- tryCatch(stats::lm(as.formula(paste0(endo," ~ ",paste(preds_all,collapse="+"))),data=sc),error=function(e) NULL)
           if (is.null(fit_full)) next
-          r2_full   <- summary(fit_full)$r.squared
-          if (is.na(r2_full) || !is.finite(r2_full) || r2_full >= 1) r2_full <- min(r2_full, 0.999999)
+          r2_full <- min(summary(fit_full)$r.squared, 0.999999)
           for (x in preds_all) {
-            preds_red <- setdiff(preds_all, x)
-            f2_val <- if (!length(preds_red)) {
-              (r2_full - 0) / (1 - r2_full)
-            } else {
-              fml_red <- as.formula(paste0(endo," ~ ", paste(preds_red, collapse=" + ")))
-              fit_red <- tryCatch(stats::lm(fml_red, data=sc), error=function(e) NULL)
-              if (is.null(fit_red)) NA_real_
-              else { r2_red <- summary(fit_red)$r.squared; (r2_full - r2_red) / (1 - r2_full) }
+            preds_red <- setdiff(preds_all,x)
+            f2_val <- if (!length(preds_red)) r2_full/(1-r2_full)
+            else {
+              fit_red <- tryCatch(stats::lm(as.formula(paste0(endo," ~ ",paste(preds_red,collapse="+"))),data=sc),error=function(e) NULL)
+              if (is.null(fit_red)) NA_real_ else { r2_r <- summary(fit_red)$r.squared; (r2_full-r2_r)/(1-r2_full) }
             }
-            out <- rbind(out, data.frame(Path=paste0(x," -> ",endo), f2=f2_val, stringsAsFactors=FALSE))
+            out <- rbind(out, data.frame(Path=paste0(x," -> ",endo),f2=f2_val,stringsAsFactors=FALSE))
           }
         }
         out
       }
 
-      f2_scores <- if (isTRUE(input$calc_f2)) calc_f2_scores(scores_df, p_df) else data.frame(Path=character(), f2=numeric())
-
-      # Tabla Paths
-      # ── IC 2.5% y 97.5% — estrategia robusta 4 niveles ──────────────────────
-      ic_lo_v <- rep(NA_real_, nrow(bp))
-      ic_hi_v <- rep(NA_real_, nrow(bp))
-
-      # Nivel 1: nombres exactos conocidos de seminr
-      known_lo <- c("2.5%","2.5 %","CI_lower","CI_Lower","Lower","lower","LL",
-                    "Perc_2.5","lower_2.5","Boot_2.5","2.5% CI","CI 2.5%",
-                    "Lower CI","lower_ci","lowerci","ci_low","low_ci")
-      known_hi <- c("97.5%","97.5 %","CI_upper","CI_Upper","Upper","upper","UL",
-                    "Perc_97.5","upper_97.5","Boot_97.5","97.5% CI","CI 97.5%",
-                    "Upper CI","upper_ci","upperci","ci_high","high_ci")
-      bp_nms_low <- tolower(trimws(names(bp)))
-      for (nm in known_lo) {
-        idx <- which(bp_nms_low == tolower(trimws(nm)))
-        if (length(idx) > 0) { ic_lo_v <- suppressWarnings(as.numeric(bp[[idx[1]]])); break }
-      }
-      for (nm in known_hi) {
-        idx <- which(bp_nms_low == tolower(trimws(nm)))
-        if (length(idx) > 0) { ic_hi_v <- suppressWarnings(as.numeric(bp[[idx[1]]])); break }
-      }
-
-      # Nivel 2: buscar columnas que contengan "2.5" o "97.5" en el nombre
-      if (all(is.na(ic_lo_v))) {
-        for (nm in names(bp)) {
-          if (grepl("2.5", nm, fixed=TRUE) || grepl("2,5", nm, fixed=TRUE)) {
-            v <- suppressWarnings(as.numeric(bp[[nm]]))
-            if (!all(is.na(v))) { ic_lo_v <- v; break }
-          }
-        }
-      }
-      if (all(is.na(ic_hi_v))) {
-        for (nm in names(bp)) {
-          if (grepl("97.5", nm, fixed=TRUE) || grepl("97,5", nm, fixed=TRUE)) {
-            v <- suppressWarnings(as.numeric(bp[[nm]]))
-            if (!all(is.na(v))) { ic_hi_v <- v; break }
-          }
-        }
-      }
-
-      # Nivel 3: posición de columna (seminr estándar: col5=2.5%, col6=97.5%)
-      if (all(is.na(ic_lo_v)) && ncol(bp) >= 5) {
-        num_cols_idx <- which(sapply(bp, function(x) {
-          v <- suppressWarnings(as.numeric(x)); !all(is.na(v))
-        }))
-        if (length(num_cols_idx) >= 6) {
-          ic_lo_v <- suppressWarnings(as.numeric(bp[[num_cols_idx[5]]]))
-          ic_hi_v <- suppressWarnings(as.numeric(bp[[num_cols_idx[6]]]))
-        } else if (length(num_cols_idx) == 5) {
-          ic_lo_v <- suppressWarnings(as.numeric(bp[[num_cols_idx[4]]]))
-          ic_hi_v <- suppressWarnings(as.numeric(bp[[num_cols_idx[5]]]))
-        }
-      }
-
-      # Nivel 4 (siempre aplicado como fallback): beta ± 1.96*SE (aprox. normal)
-      # Este método es estándar y aceptado en publicaciones cuando el bootstrap
-      # no expone directamente los percentiles
-      if (all(is.na(ic_lo_v)) || all(is.na(ic_hi_v))) {
-        ic_lo_v <- as.numeric(beta_v) - 1.96 * STDEV_raw
-        ic_hi_v <- as.numeric(beta_v) + 1.96 * STDEV_raw
-      }
+      f2_scores <- if (isTRUE(input$calc_f2)) calc_f2_scores(scores_df, p_df) else data.frame(Path=character(),f2=numeric())
 
       paths_df_out <- data.frame(
-        Path    = gsub("->", " -> ", path_lbl),
+        Path    = path_lbl,
         Beta    = round(as.numeric(beta_v), 3),
         STDEV   = round(STDEV_raw, 3),
         T_Valor = round(T_raw, 3),
         P_Valor = round(p_raw, 4),
         IC_2.5  = round(as.numeric(ic_lo_v), 3),
         IC_97.5 = round(as.numeric(ic_hi_v), 3),
-        Sig     = ifelse(p_raw < 0.001, "***", ifelse(p_raw < 0.01, "**", ifelse(p_raw < 0.05, "*", ifelse(p_raw < 0.10, "†", "n.s.")))),
+        Sig     = ifelse(p_raw<0.001,"***",ifelse(p_raw<0.01,"**",ifelse(p_raw<0.05,"*",ifelse(p_raw<0.10,"\u2020","n.s.")))),
         f2      = NA_real_,
         stringsAsFactors = FALSE
       )
-
       if (nrow(f2_scores) > 0) {
-        key_out <- gsub("\\s+","", paths_df_out$Path)
-        key_f2  <- gsub("\\s+","", f2_scores$Path)
-        for (k in seq_len(nrow(paths_df_out))) {
-          idx <- which(key_f2 == key_out[k])
-          if (length(idx)) paths_df_out$f2[k] <- round(f2_scores$f2[idx[1]], 3)
+        kout <- gsub("\\s+","",paths_df_out$Path); kf2 <- gsub("\\s+","",f2_scores$Path)
+        for (k in seq_len(nrow(paths_df_out))) { idx2 <- which(kf2==kout[k]); if(length(idx2)) paths_df_out$f2[k] <- round(f2_scores$f2[idx2[1]],3) }
+      }
+      # ── Ajuste HOC x2: SOLO válido para variable exógena DICOTÓMICA (0/1) ─────
+      # ADVERTENCIA: Este ajuste multiplica β, STDEV e IC por 2.
+      # Es un parche de escala que SÓLO puede aproximarse a SmartPLS cuando la
+      # variable exógena es dicotómica (rango [0,1]). Con variables Likert continuas
+      # este ajuste DISTORSIONA los resultados y NO debe usarse.
+      # Para HOC con variables continuas el Two-Stage ya calcula los valores correctos.
+      if (isTRUE(input$hoc_x2)) {
+
+        # ── Detectar si alguna variable exógena es dicotómica (0/1) ──────────────
+        # La variable exógena puede aparecer de dos formas:
+        #   1. Como nombre de constructo (ej: "ML") cuyos ítems apuntan a una
+        #      columna dicotómica real en hoc_data (ej: "Modalidad_laboral")
+        #   2. Como nombre de columna directamente en hoc_data
+        # Por eso buscamos primero a través del construct_items_map, y si no,
+        # directamente en las columnas de hoc_data.
+        exog_vars <- unique(p_df$from[!(p_df$from %in% p_df$to)])
+        is_dichot <- FALSE
+
+        check_cols_dichot <- function(col_names) {
+          # Devuelve TRUE si CUALQUIERA de las columnas dadas es dicotómica (0/1)
+          for (cn in col_names) {
+            if (cn %in% names(hoc_data)) {
+              vals <- unique(na.omit(suppressWarnings(as.numeric(hoc_data[[cn]]))))
+              message("[HOC x2] Revisando columna '", cn, "' → valores únicos: ",
+                      paste(sort(vals), collapse = ", "))
+              if (length(vals) >= 1 && length(vals) <= 2 && all(vals %in% c(0, 1))) {
+                message("[HOC x2] ✓ Dicotómica confirmada: '", cn, "'")
+                return(TRUE)
+              }
+            }
+          }
+          FALSE
+        }
+
+        if (length(exog_vars) > 0 && !is.null(hoc_data)) {
+          for (ev in exog_vars) {
+            # Ruta 1: el constructo tiene ítems definidos → revisar esos ítems
+            items_ev <- construct_items_map[[ev]]
+            if (!is.null(items_ev) && length(items_ev) > 0) {
+              if (check_cols_dichot(items_ev)) { is_dichot <- TRUE; break }
+            }
+            # Ruta 2: el nombre del constructo ES una columna en hoc_data
+            if (check_cols_dichot(c(ev))) { is_dichot <- TRUE; break }
+            # Ruta 3: búsqueda insensible a mayúsculas/guiones sobre todas las columnas
+            ev_clean <- tolower(gsub("[^[:alnum:]]", "", ev))
+            matched <- names(hoc_data)[tolower(gsub("[^[:alnum:]]", "", names(hoc_data))) == ev_clean]
+            if (length(matched) > 0) {
+              if (check_cols_dichot(matched)) { is_dichot <- TRUE; break }
+            }
+            message("[HOC x2] Constructo '", ev, "' no resuelto como dicotómico.",
+                    " Ítems definidos: ", paste(items_ev %||% "ninguno", collapse = ", "))
+          }
+        }
+
+        if (is_dichot) {
+          # Aplicar ajuste × 2 SOLO cuando la exógena es dicotómica (0/1)
+          message("[HOC x2] Variable exógena dicotómica detectada — aplicando ajuste × 2")
+          paths_df_out$Beta    <- round(paths_df_out$Beta    * 2, 3)
+          paths_df_out$STDEV   <- round(paths_df_out$STDEV   * 2, 3)
+          paths_df_out$IC_2.5  <- round(paths_df_out$IC_2.5  * 2, 3)
+          paths_df_out$IC_97.5 <- round(paths_df_out$IC_97.5 * 2, 3)
+          # Recalcular T con los valores ajustados
+          paths_df_out$T_Valor <- round(paths_df_out$Beta / paths_df_out$STDEV, 3)
+          df_hoc <- max(nrow(hoc_data) - 1, 1)
+          paths_df_out$P_Valor <- round(2 * (1 - pt(abs(paths_df_out$T_Valor), df = df_hoc)), 4)
+          paths_df_out$Sig <- ifelse(paths_df_out$P_Valor < 0.001, "***",
+                               ifelse(paths_df_out$P_Valor < 0.01,  "**",
+                               ifelse(paths_df_out$P_Valor < 0.05,  "*",
+                               ifelse(paths_df_out$P_Valor < 0.10,  "\u2020", "n.s."))))
+          results$log <- paste0(results$log %||% "",
+            "\n\u26a0\ufe0f Ajuste HOC \u00d72 APLICADO: variable ex\u00f3gena dic\u00f3toma detectada. Resultado compatible con SmartPLS.")
+        } else {
+          # Variable continua (Likert, etc.) — NO aplicar ajuste, mostrar advertencia
+          message("[HOC x2] ADVERTENCIA: variable exógena NO es dicotómica. Ajuste × 2 OMITIDO para evitar resultados incorrectos.")
+          results$log <- paste0(results$log %||% "",
+            "\n\u274c Ajuste HOC \u00d72 IGNORADO: la variable ex\u00f3gena no es dic\u00f3toma (0/1). ",
+            "Con variables Likert/continuas el Two-Stage ya da los valores correctos. ",
+            "Los resultados son comparables a SmartPLS SIN aplicar el ajuste \u00d72. ",
+            "Desmarca la opci\u00f3n '\U0001f53a Ajuste HOC \u00d72' para evitar esta advertencia.")
         }
       }
       results$tables$Paths <- paths_df_out
@@ -2372,6 +3405,115 @@ observe({
         results$tables$VIF <- data.frame(Nota = "VIF no disponible en esta version de seminr")
       }
 
+
+      # ── 11b. VIF ESTRUCTURAL (Hair et al., 2022) ──────────────────────────
+      # Regresión de cada endógeno sobre sus predictores → VIF por predictor
+      # Idéntico al "Inner VIF" de SmartPLS. Usa construct scores del PLS.
+      tryCatch({
+        if (!is.null(scores_df) && !is.null(p_df) && nrow(p_df) > 0) {
+          vif_struct_rows <- list()
+
+          for (endo in unique(p_df$to)) {
+            preds <- unique(p_df$from[p_df$to == endo])
+            preds <- preds[preds %in% names(scores_df)]
+            endo_col <- if (endo %in% names(scores_df)) endo else NULL
+
+            if (is.null(endo_col) || length(preds) == 0) next
+
+            if (length(preds) == 1) {
+              # Solo 1 predictor → VIF = 1.000 por definición
+              vif_struct_rows[[length(vif_struct_rows)+1]] <- data.frame(
+                Endogeno  = endo,
+                Predictor = preds[1],
+                VIF       = 1.000,
+                Status    = "✓ OK (<3.3)",
+                stringsAsFactors = FALSE
+              )
+            } else {
+              # ≥2 predictores: VIF(xi) = 1 / (1 - R² de xi ~ resto)
+              for (x in preds) {
+                otros <- setdiff(preds, x)
+                fml   <- as.formula(paste0("`", x, "` ~ ",
+                           paste0("`", otros, "`", collapse = " + ")))
+                fit_x <- tryCatch(
+                  stats::lm(fml, data = scores_df[, c(x, otros), drop = FALSE]),
+                  error = function(e) NULL
+                )
+                if (!is.null(fit_x)) {
+                  r2x   <- summary(fit_x)$r.squared
+                  vif_v <- if (!is.na(r2x) && r2x < 0.9999) round(1 / (1 - r2x), 3) else 999.0
+                  status_v <- if (vif_v < 3.3) "✓ OK (<3.3)" else
+                              if (vif_v < 5.0) "⚠ Moderate (<5)" else "✗ Problematic (≥5)"
+                  vif_struct_rows[[length(vif_struct_rows)+1]] <- data.frame(
+                    Endogeno  = endo,
+                    Predictor = x,
+                    VIF       = vif_v,
+                    Status    = status_v,
+                    stringsAsFactors = FALSE
+                  )
+                }
+              }
+            }
+          }
+
+          if (length(vif_struct_rows) > 0) {
+            results$tables$VIF_Structural <- do.call(rbind, vif_struct_rows)
+          } else {
+            results$tables$VIF_Structural <- data.frame(
+              Nota = "VIF Estructural no disponible: verifica los scores del modelo")
+          }
+        }
+      }, error = function(e) {
+        message("[VIF_Structural] Error: ", e$message)
+        results$tables$VIF_Structural <- data.frame(Nota = paste("Error:", e$message))
+      })
+
+      # ── 11c. VIF COLINEALIDAD TOTAL – CMB (Kock, 2015) ────────────────────
+      # Para cada variable latente LV_i:
+      #   Regresa LV_i sobre TODAS las demás variables latentes simultáneamente.
+      #   VIF(LV_i) = 1 / (1 - R²_i)
+      # Criterio: VIF < 3.3 → sin riesgo CMB  |  VIF ≥ 3.3 → riesgo potencial
+      tryCatch({
+        if (!is.null(scores_df) && ncol(scores_df) >= 2) {
+          all_lv   <- names(scores_df)
+          vif_full_rows <- list()
+
+          for (lv in all_lv) {
+            otros_lv <- setdiff(all_lv, lv)
+            otros_lv <- otros_lv[otros_lv %in% names(scores_df)]
+            if (length(otros_lv) == 0) next
+
+            fml_full <- as.formula(paste0("`", lv, "` ~ ",
+                          paste0("`", otros_lv, "`", collapse = " + ")))
+            fit_full <- tryCatch(
+              stats::lm(fml_full, data = scores_df[, c(lv, otros_lv), drop = FALSE]),
+              error = function(e) NULL
+            )
+            if (!is.null(fit_full)) {
+              r2_full  <- summary(fit_full)$r.squared
+              vif_full <- if (!is.na(r2_full) && r2_full < 0.9999) round(1 / (1 - r2_full), 3) else 999.0
+              status_full <- if (vif_full < 3.3) "✓ No CMB risk (<3.3)" else "✗ Potential CMB (≥3.3)"
+              vif_full_rows[[length(vif_full_rows)+1]] <- data.frame(
+                Latent_Variable = lv,
+                VIF             = vif_full,
+                Status          = status_full,
+                stringsAsFactors = FALSE
+              )
+            }
+          }
+
+          if (length(vif_full_rows) > 0) {
+            results$tables$VIF_Full <- do.call(rbind, vif_full_rows)
+          } else {
+            results$tables$VIF_Full <- data.frame(
+              Nota = "VIF Colinealidad Total no disponible")
+          }
+        }
+      }, error = function(e) {
+        message("[VIF_Full] Error: ", e$message)
+        results$tables$VIF_Full <- data.frame(Nota = paste("Error:", e$message))
+      })
+
       # ── 12. SRMR ─────────────────────────────────────────────────────────
       srmr_val <- NA_real_
 
@@ -2737,6 +3879,84 @@ observe({
     dt
   })
 
+  # ── VIF Estructural renderDT (Hair et al., 2022) ─────────────────────────
+  output$table_vif_structural <- renderDT({
+    req(results$tables$VIF_Structural)
+    df <- results$tables$VIF_Structural
+    if ("Nota" %in% names(df))
+      return(datatable(df, rownames = FALSE, options = list(dom = "t")))
+
+    dt <- datatable(
+      df,
+      rownames = FALSE,
+      colnames = c("Endogenous" = "Endogeno",
+                   "Predictor"  = "Predictor",
+                   "VIF"        = "VIF",
+                   "Status"     = "Status"),
+      options = list(pageLength = 20, dom = "tip", scrollX = TRUE),
+      caption = htmltools::tags$caption(
+        style = "caption-side:top; font-weight:bold; color:#1565C0; font-size:14px;",
+        "Structural Model Collinearity (Hair et al., 2022)"
+      )
+    ) |>
+      formatStyle("VIF",
+        backgroundColor = styleInterval(c(3.299, 4.999),
+          c("#C8E6C9", "#FFF9C4", "#FFCDD2")),
+        fontWeight = "bold"
+      ) |>
+      formatStyle("Status",
+        color = styleEqual(
+          c("✓ OK (<3.3)", "⚠ Moderate (<5)", "✗ Problematic (≥5)"),
+          c("#2E7D32",     "#F57F17",          "#C62828")
+        ),
+        fontWeight = "bold"
+      )
+    dt
+  })
+
+  # ── VIF Colinealidad Total renderDT (Kock, 2015) ─────────────────────────
+  output$table_vif_full <- renderDT({
+    req(results$tables$VIF_Full)
+    df <- results$tables$VIF_Full
+    if ("Nota" %in% names(df))
+      return(datatable(df, rownames = FALSE, options = list(dom = "t")))
+
+    dt <- datatable(
+      df,
+      rownames = FALSE,
+      colnames = c("Latent Variable" = "Latent_Variable",
+                   "VIF"             = "VIF",
+                   "Status"          = "Status"),
+      options = list(pageLength = 20, dom = "tip", scrollX = TRUE),
+      caption = htmltools::tags$caption(
+        style = "caption-side:top; font-weight:bold; color:#E65100; font-size:14px;",
+        "Full Collinearity Assessment (Common Method Bias – Kock, 2015)"
+      )
+    ) |>
+      formatStyle("VIF",
+        backgroundColor = styleInterval(3.299,
+          c("#C8E6C9", "#FFCDD2")),
+        fontWeight = "bold"
+      ) |>
+      formatStyle("Status",
+        color = styleEqual(
+          c("✓ No CMB risk (<3.3)", "✗ Potential CMB (≥3.3)"),
+          c("#2E7D32",              "#C62828")
+        ),
+        fontWeight = "bold"
+      )
+    dt
+  })
+
+  # ── Note reactive for VIF Full (language-aware) ───────────────────────────
+  output$vif_full_note_ui <- renderUI({
+    es <- (input$app_lang %||% "es") == "es"
+    if (es)
+      tags$span("Los valores de VIF inferiores a 3.3 sugieren ausencia de sesgo de método común (Kock, 2015).")
+    else
+      tags$span("VIF values below 3.3 suggest absence of common method bias (Kock, 2015).")
+  })
+
   output$table_srmr <- renderDT({
     req(results$tables$SRMR)
     datatable(results$tables$SRMR, rownames=FALSE, options=list(dom="t"))
@@ -3058,6 +4278,356 @@ observe({
         print(doc, target = file)
       })
     }
+  )
+
+  # ── GAUSSIAN COPULA ENDOGENEITY TEST  v3.0 ───────────────────────────────────
+
+  copula_results <- reactiveValues(
+    table        = NULL,
+    plot_forest  = NULL,
+    scores_df    = NULL,   # saved for visualization plot
+    p_df         = NULL,   # saved for visualization path selector
+    status       = NULL,
+    score_method = "PLS latent scores (seminr)",
+    construct_items_map = NULL
+  )
+
+  # ── helper: get p_df from current model inputs ──────────────────────────────
+  get_p_df <- function() {
+    df <- data.frame(from = character(), to = character(), stringsAsFactors = FALSE)
+    for (i in seq_len(isolate(path_count()))) {
+      fr <- trimws(isolate(input[[paste0("p_from_", i)]]) %||% "")
+      to <- trimws(isolate(input[[paste0("p_to_",   i)]]) %||% "")
+      if (nzchar(fr) && nzchar(to))
+        df <- rbind(df, data.frame(from = fr, to = to, stringsAsFactors = FALSE))
+    }
+    df
+  }
+
+  # ── helper: rebuild construct_items_map from model inputs ──────────────────
+  get_construct_items_map <- function() {
+    df <- data_raw(); if (is.null(df)) return(NULL)
+    out <- list()
+    for (i in seq_len(isolate(construct_count()))) {
+      nm <- trimws(isolate(input[[paste0("c_name_", i)]]) %||% "")
+      it <- isolate(get_items_str(i))
+      if (!nzchar(nm) || !nzchar(it)) next
+      items <- parse_item_range(it, names(df))
+      if (length(items) > 0) out[[nm]] <- items
+    }
+    if (length(out) == 0) NULL else out
+  }
+
+  observeEvent(input$run_copula_test, {
+    use_mean  <- isTRUE(isolate(input$copula_use_mean_scores))
+    pls_obj   <- results$pls_est
+    raw_data  <- data_raw()
+    cim       <- get_construct_items_map()
+    p_df      <- get_p_df()
+
+    # ── Resolve scores ───────────────────────────────────────────────────────
+    scores_df <- build_scores_df(pls_obj, raw_data, cim, use_mean_scores = use_mean)
+
+    if (is.null(scores_df) || nrow(scores_df) == 0) {
+      copula_results$status <- paste0(
+        "No se pudieron obtener los scores de constructos. ",
+        if (use_mean) "Verifique que los indicadores estén definidos en el modelo."
+        else "Ejecute el análisis PLS-SEM primero."
+      )
+      copula_results$table <- NULL
+      return()
+    }
+
+    copula_results$scores_df    <- scores_df
+    copula_results$p_df         <- p_df
+    copula_results$construct_items_map <- cim
+    copula_results$score_method <- if (use_mean) "Composite mean scores (rowMeans per construct)"
+                                   else          "PLS latent scores (seminr::construct_scores)"
+
+    # ── Run copula test ───────────────────────────────────────────────────────
+    tryCatch({
+      copula_tbl <- run_gaussian_copula(
+        scores_df   = scores_df,
+        p_df        = p_df,
+        paths_table = results$tables$Paths,
+        lang        = isolate(input$app_lang)
+      )
+      copula_results$table  <- copula_tbl
+      copula_results$status <- "ok"
+
+      # ── Build forest plot ─────────────────────────────────────────────────
+      copula_results$plot_forest <- make_copula_results_plot(copula_tbl)
+
+    }, error = function(e) {
+      copula_results$status <- paste0("Error: ", e$message)
+      copula_results$table  <- NULL
+    })
+  })
+
+  # ── Status banner ────────────────────────────────────────────────────────────
+  output$copula_status_ui <- renderUI({
+    s <- copula_results$status
+    if (is.null(s)) return(tags$div(style="color:#888; font-style:italic;",
+      "Click \u25b6 Run Gaussian Copula Test after running PLS-SEM analysis."))
+    if (s == "ok") {
+      tbl <- copula_results$table
+      any_endo <- any(tbl$p_value < 0.05, na.rm = TRUE)
+      style_ok  <- "background:#E8F5E9;border-left:4px solid #2E7D32;padding:8px;border-radius:4px;"
+      style_warn<- "background:#FFEBEE;border-left:4px solid #C62828;padding:8px;border-radius:4px;"
+      if (any_endo) {
+        tags$div(style = style_warn,
+          tags$b(style = "color:#C62828;",
+            "\u26a0 Potential endogeneity detected in at least one predictor (p < 0.05)"))
+      } else {
+        tags$div(style = style_ok,
+          tags$b(style = "color:#2E7D32;",
+            "\u2713 No evidence of endogeneity detected (all p \u2265 0.05)"))
+      }
+    } else {
+      tags$div(style = "background:#FFEBEE;border-left:4px solid #E53935;padding:8px;border-radius:4px;",
+        tags$b(style = "color:#C62828;", paste0("\u2717 ", s)))
+    }
+  })
+
+  # ── Technical details box ────────────────────────────────────────────────────
+  output$copula_tech_details_ui <- renderUI({
+    req(copula_results$status == "ok")
+    tbl <- copula_results$table
+    n_row <- if (!is.null(tbl) && nrow(tbl) > 0) tbl$N_used[1] else "N/A"
+    fml_row <- if (!is.null(tbl) && nrow(tbl) > 0) tbl$Formula[1] else "Y ~ X + Copula(X)"
+    tags$div(style = "background:#F3E5F5;border-left:4px solid #7B1FA2;padding:10px;border-radius:4px;margin-bottom:8px;",
+      tags$b(style="color:#6A1B9A;", "\U0001f527 Technical Details"),
+      tags$ul(style="margin:6px 0 0 0; padding-left:20px; font-size:13px;",
+        tags$li(tags$b("Scoring method: "), copula_results$score_method),
+        tags$li(tags$b("Ranking formula: "), "rank(x) / (n + 1)  [Park & Gupta, 2012]"),
+        tags$li(tags$b("Inverse normal: "), "qnorm()  [\u03a6\u207b\u00b9]"),
+        tags$li(tags$b("NA handling: "), paste0("Complete-case on X and Y (+ controls); N = ", n_row)),
+        tags$li(tags$b("Regression: "), fml_row),
+        tags$li(tags$b("SE type: "), "OLS (conventional); two-tailed t-test"),
+        tags$li(tags$b("PLS \u03b2 source: "), "Bootstrapped path coefficient from Paths table (not bivariate OLS)")
+      )
+    )
+  })
+
+  # ── Results table ────────────────────────────────────────────────────────────
+  output$table_copula <- renderDT({
+    df <- copula_results$table
+    if (is.null(df)) return(datatable(
+      data.frame(Note = "Click '\u25b6 Run Gaussian Copula Test' after running PLS-SEM analysis."),
+      rownames = FALSE, options = list(dom = "t")))
+    display_df <- df[, c("Path","PLS_Beta","Copula_Coef","Std_Error","CI_lo","CI_hi",
+                         "t_value","p_value","N_used","Interpretation")]
+    names(display_df) <- c("Path","PLS \u03b2","Copula Coeff.","Std. Error",
+                           "CI 2.5%","CI 97.5%","t-value","p-value","N","Interpretation")
+    datatable(display_df, rownames = FALSE,
+              options = list(pageLength = 15, dom = "tip", scrollX = TRUE)) |>
+      formatRound(c("PLS \u03b2","Copula Coeff.","Std. Error","CI 2.5%","CI 97.5%","t-value"), digits = 4) |>
+      formatRound("p-value", digits = 4) |>
+      formatStyle("p-value",
+        backgroundColor = styleInterval(c(0.049, 0.099),
+                          c("#FFCDD2", "#FFF9C4", "#C8E6C9")),
+        fontWeight = "bold") |>
+      formatStyle("Interpretation",
+        color = styleEqual(
+          c("\u26a0 Potential endogeneity detected (p < 0.05)",
+            "\u2713 No evidence of endogeneity (p \u2265 0.05)",
+            "\u26a0 Posible endogeneidad detectada (p < 0.05)",
+            "\u2713 Sin evidencia de endogeneidad (p \u2265 0.05)"),
+          c("#C62828", "#2E7D32", "#C62828", "#2E7D32")),
+        fontWeight = "bold")
+  })
+
+  # ── Plot A: Forest (render) ───────────────────────────────────────────────────
+  output$plot_copula_forest <- renderPlot({
+    p <- copula_results$plot_forest
+    if (is.null(p)) return(NULL)
+    print(p)
+  })
+
+  # ── Path selector for viz plot ────────────────────────────────────────────────
+  output$copula_viz_path_selector_ui <- renderUI({
+    p_df <- copula_results$p_df
+    if (is.null(p_df) || nrow(p_df) == 0)
+      return(tags$p("Run the Copula Test first.", style = "color:#888;"))
+    choices <- paste0(p_df$from, " \u2192 ", p_df$to)
+    selectInput("copula_viz_path", "Select path:", choices = choices, selected = choices[1])
+  })
+
+  output$copula_viz_n_ui <- renderUI({
+    scores_df <- copula_results$scores_df
+    p_df      <- copula_results$p_df
+    sel       <- input$copula_viz_path
+    if (is.null(scores_df) || is.null(p_df) || is.null(sel) || !nzchar(sel))
+      return(NULL)
+    # parse selected path
+    parts <- strsplit(sel, " \u2192 ")[[1]]
+    if (length(parts) != 2) return(NULL)
+    x_nm <- trimws(parts[1]); y_nm <- trimws(parts[2])
+    if (!(x_nm %in% names(scores_df)) || !(y_nm %in% names(scores_df))) return(NULL)
+    xv <- as.numeric(scores_df[[x_nm]]); yv <- as.numeric(scores_df[[y_nm]])
+    n  <- sum(!is.na(xv) & !is.na(yv))
+    tags$div(style = "padding-top:24px; color:#1565C0; font-weight:bold; font-size:14px;",
+             paste0("N = ", n))
+  })
+
+  # ── Plot B: Visualization (render) ───────────────────────────────────────────
+  output$plot_copula_viz <- renderPlot({
+    scores_df <- copula_results$scores_df
+    sel       <- input$copula_viz_path
+    view_type <- input$copula_viz_type %||% "scatter"
+    if (is.null(scores_df) || is.null(sel) || !nzchar(sel)) return(NULL)
+    parts <- strsplit(sel, " \u2192 ")[[1]]
+    if (length(parts) != 2) return(NULL)
+    x_nm <- trimws(parts[1]); y_nm <- trimws(parts[2])
+    p <- make_copula_visualization_plot(scores_df, x_nm, y_nm, view_type)
+    if (is.null(p)) return(NULL)
+    print(p)
+  })
+
+  # ── Save helpers (generalized) ───────────────────────────────────────────────
+  save_gg_png <- function(plot_obj, file) {
+    req(!is.null(plot_obj))
+    ggplot2::ggsave(file, plot = plot_obj, dpi = 300, width = 12, height = 7, units = "in")
+  }
+  save_gg_pdf <- function(plot_obj, file) {
+    req(!is.null(plot_obj))
+    pdf(file, width = 12, height = 7, useDingbats = FALSE); print(plot_obj); dev.off()
+  }
+  save_gg_svg <- function(plot_obj, file) {
+    req(!is.null(plot_obj))
+    tryCatch({
+      svglite::svglite(file, width = 12, height = 7); print(plot_obj); dev.off()
+    }, error = function(e) {
+      ggplot2::ggsave(file, plot = plot_obj, device = "svg", width = 12, height = 7)
+    })
+  }
+
+  # ── Current viz plot (reactive) ───────────────────────────────────────────────
+  current_viz_plot <- reactive({
+    scores_df <- copula_results$scores_df
+    sel       <- input$copula_viz_path
+    view_type <- input$copula_viz_type %||% "scatter"
+    if (is.null(scores_df) || is.null(sel) || !nzchar(sel)) return(NULL)
+    parts <- strsplit(sel, " \u2192 ")[[1]]
+    if (length(parts) != 2) return(NULL)
+    x_nm <- trimws(parts[1]); y_nm <- trimws(parts[2])
+    make_copula_visualization_plot(scores_df, x_nm, y_nm, view_type)
+  })
+
+  # ── Download handlers — TABLE ─────────────────────────────────────────────────
+  output$dl_copula_csv <- downloadHandler(
+    filename = function() paste0("GaussianCopula_", Sys.Date(), ".csv"),
+    contentType = "text/csv",
+    content = function(file) {
+      df <- copula_results$table; req(!is.null(df))
+      write.csv(df, file, row.names = FALSE, fileEncoding = "UTF-8")
+    }
+  )
+
+  output$dl_copula_excel <- downloadHandler(
+    filename = function() paste0("GaussianCopula_", Sys.Date(), ".xlsx"),
+    contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    content = function(file) {
+      df <- copula_results$table; req(!is.null(df))
+      tryCatch({
+        wb <- openxlsx::createWorkbook()
+        openxlsx::addWorksheet(wb, "Gaussian Copula")
+        openxlsx::writeData(wb, 1, df)
+        hs <- openxlsx::createStyle(fgFill="#1565C0", fontColour="white",
+                                    textDecoration="bold", halign="center")
+        openxlsx::addStyle(wb, 1, hs, rows=1, cols=seq_len(ncol(df)), gridExpand=TRUE)
+        openxlsx::setColWidths(wb, 1, cols=seq_len(ncol(df)), widths="auto")
+        openxlsx::saveWorkbook(wb, file, overwrite=TRUE)
+      }, error = function(e) write.csv(df, file, row.names=FALSE))
+    }
+  )
+
+  output$dl_copula_word <- downloadHandler(
+    filename = function() paste0("GaussianCopula_", Sys.Date(), ".docx"),
+    contentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    content = function(file) {
+      df <- copula_results$table; req(!is.null(df))
+      tryCatch({
+        doc <- officer::read_docx()
+        doc <- officer::body_add_par(doc, "Gaussian Copula Endogeneity Test", style="heading 1")
+        doc <- officer::body_add_par(doc, "Park & Gupta (2012) | PLS-SEM Robustness Analysis", style="heading 2")
+        doc <- officer::body_add_par(doc,
+          paste0("Scoring: ", copula_results$score_method,
+                 " | Ranking: rank/(n+1) | NA: complete-case | SE: OLS two-tailed"),
+          style="Normal")
+        disp <- df[, c("Path","PLS_Beta","Copula_Coef","Std_Error","CI_lo","CI_hi",
+                       "t_value","p_value","N_used","Interpretation")]
+        names(disp) <- c("Path","PLS Beta","Copula Coef","SE","CI 2.5%","CI 97.5%",
+                         "t","p","N","Interpretation")
+        ft <- flextable::flextable(as.data.frame(lapply(disp, as.character)))
+        ft <- flextable::bold(ft, part="header")
+        ft <- flextable::bg(ft, part="header", bg="#1565C0")
+        ft <- flextable::color(ft, part="header", color="white")
+        ft <- flextable::autofit(ft)
+        ft <- flextable::theme_booktabs(ft)
+        doc <- flextable::body_add_flextable(doc, ft)
+        print(doc, target=file)
+      }, error = function(e) {
+        doc <- officer::read_docx()
+        officer::body_add_par(doc, paste("Error:", e$message))
+        print(doc, target=file)
+      })
+    }
+  )
+
+  output$dl_copula_pdf <- downloadHandler(
+    filename = function() paste0("GaussianCopula_table_", Sys.Date(), ".pdf"),
+    contentType = "application/pdf",
+    content = function(file) {
+      df <- copula_results$table; req(!is.null(df))
+      tryCatch({
+        tmp_html <- tempfile(fileext=".html")
+        writeLines(c("<html><body><h2>Gaussian Copula Results</h2>",
+          knitr::kable(df, format="html"), "</body></html>"), tmp_html)
+        # Fallback: write CSV if PDF tools unavailable
+      }, error = function(e) NULL)
+      # Reliable fallback: save results as simple PDF via grDevices
+      pdf(file, width=14, height=max(3, nrow(df)*0.4 + 2))
+      grid::grid.newpage()
+      grid::grid.text(paste(capture.output(print(df)), collapse="\n"),
+                      x=0.02, y=0.98, just=c("left","top"),
+                      gp=grid::gpar(fontsize=7, fontfamily="mono"))
+      dev.off()
+    }
+  )
+
+  # ── Download handlers — FOREST PLOT ──────────────────────────────────────────
+  output$dl_forest_png <- downloadHandler(
+    filename = function() paste0("CopulaForestPlot_", Sys.Date(), ".png"),
+    contentType = "image/png",
+    content = function(file) save_gg_png(copula_results$plot_forest, file)
+  )
+  output$dl_forest_pdf <- downloadHandler(
+    filename = function() paste0("CopulaForestPlot_", Sys.Date(), ".pdf"),
+    contentType = "application/pdf",
+    content = function(file) save_gg_pdf(copula_results$plot_forest, file)
+  )
+  output$dl_forest_svg <- downloadHandler(
+    filename = function() paste0("CopulaForestPlot_", Sys.Date(), ".svg"),
+    contentType = "image/svg+xml",
+    content = function(file) save_gg_svg(copula_results$plot_forest, file)
+  )
+
+  # ── Download handlers — VISUALIZATION PLOT ────────────────────────────────────
+  output$dl_viz_png <- downloadHandler(
+    filename = function() paste0("CopulaViz_", Sys.Date(), ".png"),
+    contentType = "image/png",
+    content = function(file) save_gg_png(current_viz_plot(), file)
+  )
+  output$dl_viz_pdf <- downloadHandler(
+    filename = function() paste0("CopulaViz_", Sys.Date(), ".pdf"),
+    contentType = "application/pdf",
+    content = function(file) save_gg_pdf(current_viz_plot(), file)
+  )
+  output$dl_viz_svg <- downloadHandler(
+    filename = function() paste0("CopulaViz_", Sys.Date(), ".svg"),
+    contentType = "image/svg+xml",
+    content = function(file) save_gg_svg(current_viz_plot(), file)
   )
 
   # ── MICOM outputs ─────────────────────────────────────────────────────────
@@ -3505,6 +5075,326 @@ observe({
       zip(zipfile = file, files = archivos, flags = "-j")
     }
   )
+
+  # ============================================================================
+  # OUTPUT: MÓDULO TAMAÑO DE MUESTRA / SAMPLE SIZE
+  # ============================================================================
+
+  output$sample_size_ui <- renderUI({
+    t  <- i18n()
+    es <- input$app_lang == "es"
+
+    # ── Auto-detect max predictors from current model ────────────────────────
+    lm  <- last_model()
+    paths_df <- if (!is.null(lm) && !is.null(lm$paths)) lm$paths else NULL
+    auto_u   <- detect_max_predictors(paths_df)
+
+    # ── Build UI ─────────────────────────────────────────────────────────────
+    fluidRow(
+      # ── LEFT: Inputs ───────────────────────────────────────────────────────
+      column(4,
+        box(
+          title = if(es) "⚙ Parámetros del Análisis" else "⚙ Analysis Parameters",
+          status = "primary", solidHeader = TRUE, width = NULL,
+
+          if (!is.null(paths_df) && nrow(paths_df) > 0) {
+            div(class = "tooltip-box",
+              tags$b(if(es) "🔍 Auto-detectado del modelo:" else "🔍 Auto-detected from model:"),
+              br(),
+              tags$small(if(es)
+                paste0("El constructo con más predictores recibe ", auto_u, " flecha(s) entrante(s).")
+              else
+                paste0("The construct with most predictors has ", auto_u, " incoming arrow(s)."))
+            )
+          },
+
+          numericInput("ss_u", if(es) "Máx. predictores (u) — editable" else "Max predictors (u) — editable",
+            value = auto_u, min = 1, max = 20, step = 1),
+
+          selectInput("ss_f2", if(es) "Tamaño de efecto esperado (f²)" else "Expected effect size (f²)",
+            choices = setNames(
+              c("0.02", "0.15", "0.35"),
+              if(es) c("Pequeño — f² = 0.02","Mediano — f² = 0.15","Grande — f² = 0.35")
+              else   c("Small — f² = 0.02",  "Medium — f² = 0.15", "Large — f² = 0.35")
+            ),
+            selected = "0.15"),
+
+          selectInput("ss_alpha", if(es) "Nivel de significancia (α)" else "Significance level (α)",
+            choices = c("0.01" = "0.01", "0.05" = "0.05", "0.10" = "0.10"),
+            selected = "0.05"),
+
+          selectInput("ss_power", if(es) "Potencia estadística (1-β)" else "Statistical power (1-β)",
+            choices = c("0.80" = "0.80", "0.85" = "0.85", "0.90" = "0.90", "0.95" = "0.95"),
+            selected = "0.80"),
+
+          sliderInput("ss_margin", if(es) "Margen adicional por pérdidas (%)" else "Additional margin for data loss (%)",
+            min = 0, max = 30, value = 15, step = 5, post = "%"),
+
+          hr(),
+          numericInput("ss_n_real", if(es) "Tu muestra real (para diagnóstico)" else "Your actual sample (for diagnostics)",
+            value = NA, min = 1),
+
+          hr(),
+          tags$b(if(es) "📊 Muestra Clásica (opcional)" else "📊 Classical Sample (optional)"),
+          br(), br(),
+          checkboxInput("ss_show_classical", if(es) "Activar cálculo clásico de Cochran" else "Enable classical Cochran calculation",
+            value = FALSE),
+
+          conditionalPanel("input.ss_show_classical == true",
+            selectInput("ss_pop_type", if(es) "Tipo de población" else "Population type",
+              choices = setNames(
+                c("large", "finite"),
+                if(es) c("Grande / Desconocida", "Finita (conocida)")
+                else   c("Large / Unknown",       "Finite (known)")
+              ), selected = "large"),
+            conditionalPanel("input.ss_pop_type == 'finite'",
+              numericInput("ss_N_pop", if(es) "Tamaño poblacional (N)" else "Population size (N)",
+                value = 5000, min = 100)
+            ),
+            selectInput("ss_conf", if(es) "Nivel de confianza" else "Confidence level",
+              choices = c("90%" = "0.90", "95%" = "0.95", "99%" = "0.99"), selected = "0.95"),
+            numericInput("ss_error", if(es) "Margen de error (e)" else "Margin of error (e)",
+              value = 0.05, min = 0.01, max = 0.20, step = 0.01)
+          ),
+
+          br(),
+          actionButton("ss_calculate", if(es) "▶ CALCULAR" else "▶ CALCULATE",
+            class = "btn btn-danger btn-block", style = "font-weight:bold; font-size:15px;")
+        )
+      ),
+
+      # ── RIGHT: Results ─────────────────────────────────────────────────────
+      column(8,
+        uiOutput("ss_results_panel")
+      )
+    )
+  })
+
+  # ── Reactive: run sample size calculation ───────────────────────────────────
+  ss_calc <- eventReactive(input$ss_calculate, {
+    u      <- max(1L, as.integer(input$ss_u %||% 2L))
+    f2     <- as.numeric(input$ss_f2 %||% "0.15")
+    alpha  <- as.numeric(input$ss_alpha %||% "0.05")
+    power  <- as.numeric(input$ss_power %||% "0.80")
+    margin <- (input$ss_margin %||% 15) / 100
+
+    pw <- calculate_pls_power_n(u = u, f2 = f2, alpha = alpha, power = power, margin = margin)
+
+    cl <- NULL
+    if (isTRUE(input$ss_show_classical)) {
+      N_pop <- if (input$ss_pop_type == "finite") {
+        as.numeric(input$ss_N_pop %||% 5000)
+      } else NULL
+      cl <- calculate_classical_sample_size(
+        pop_type = input$ss_pop_type %||% "large",
+        N_pop    = N_pop,
+        conf     = as.numeric(input$ss_conf %||% "0.95"),
+        error    = as.numeric(input$ss_error %||% 0.05)
+      )
+    }
+
+    n_real <- suppressWarnings(as.numeric(input$ss_n_real))
+
+    # Build model detail string from paths
+    lm <- last_model()
+    model_detail <- ""
+    if (!is.null(lm) && !is.null(lm$paths)) {
+      pd <- lm$paths
+      if (all(c("from","to") %in% names(pd))) {
+        tbl <- sort(table(pd$to), decreasing = TRUE)
+        model_detail <- paste0(names(tbl)[1], ": ", tbl[1], " predictors")
+      }
+    }
+
+    list(pw = pw, cl = cl, n_real = n_real, model_detail = model_detail)
+  })
+
+  # ── Output: results panel ────────────────────────────────────────────────────
+  output$ss_results_panel <- renderUI({
+    es  <- input$app_lang == "es"
+
+    # Show placeholder before calculation
+    calc <- tryCatch(ss_calc(), error = function(e) NULL)
+    if (is.null(calc)) {
+      return(box(
+        title = if(es) "📊 Resultados" else "📊 Results",
+        status = "info", solidHeader = TRUE, width = NULL,
+        div(class = "tooltip-box",
+          if(es) "Configure los parámetros y presione ▶ CALCULAR para ver los resultados."
+          else   "Configure the parameters and press ▶ CALCULATE to see results."
+        )
+      ))
+    }
+
+    pw     <- calc$pw
+    cl     <- calc$cl
+    n_real <- calc$n_real
+    lang   <- if(es) "es" else "en"
+    cls    <- if (!is.na(n_real)) classify_sample_strength(n_real, pw$n_min) else NULL
+    smart  <- if (!is.na(n_real)) sample_smart_message(n_real, pw$n_min, lang) else ""
+
+    # Practical recommendation
+    prac_msg <- if(es) {
+      if      (pw$u <= 1)  "Modelo simple (1 predictor): se recomienda al menos 100 casos para estabilidad del bootstrapping."
+      else if (pw$u <= 2)  "Modelo moderado (2 predictores): se recomienda al menos 150–200 casos."
+      else if (pw$u <= 3)  "Modelo con mediación (3 predictores): se recomienda al menos 200 casos."
+      else                 "Modelo complejo (≥4 predictores o con moderación/MGA): se recomienda al menos 250–300 casos."
+    } else {
+      if      (pw$u <= 1)  "Simple model (1 predictor): at least 100 cases are recommended for bootstrapping stability."
+      else if (pw$u <= 2)  "Moderate model (2 predictors): at least 150–200 cases are recommended."
+      else if (pw$u <= 3)  "Mediation model (3 predictors): at least 200 cases are recommended."
+      else                 "Complex model (≥4 predictors or moderation/MGA): at least 250–300 cases are recommended."
+    }
+
+    tagList(
+      # ── PANEL 1: Power analysis results ───────────────────────────────────
+      box(
+        title = if(es) "🔬 Power Analysis para PLS-SEM" else "🔬 Power Analysis for PLS-SEM",
+        status = "danger", solidHeader = TRUE, width = NULL,
+
+        div(class = "tooltip-box", style = "margin-bottom:12px;",
+          tags$b(if(es) "📐 Criterio principal en PLS-SEM:" else "📐 Main criterion in PLS-SEM:"),
+          if(es) " El tamaño de muestra se determina por potencia estadística del modelo, no por la fórmula clásica de 384."
+          else   " Sample size is determined by the model's statistical power, not the classical n = 384 formula."
+        ),
+
+        fluidRow(
+          column(4,
+            div(style = "background:#E3F2FD; border-radius:8px; padding:14px; text-align:center;",
+              tags$h2(style="color:#1565C0; margin:0;", pw$n_min),
+              tags$small(if(es) "N mínimo (power analysis)" else "Minimum N (power analysis)")
+            )
+          ),
+          column(4,
+            div(style = "background:#E8F5E9; border-radius:8px; padding:14px; text-align:center;",
+              tags$h2(style="color:#2E7D32; margin:0;", pw$n_target),
+              tags$small(if(es) paste0("N objetivo (+", round(pw$margin*100), "% margen)")
+                              else paste0("Target N (+", round(pw$margin*100), "% margin)"))
+            )
+          ),
+          column(4,
+            div(style = "background:#FFF3E0; border-radius:8px; padding:14px; text-align:center;",
+              tags$h2(style="color:#E65100; margin:0;", pw$u),
+              tags$small(if(es) "Predictores máx. (u)" else "Max predictors (u)")
+            )
+          )
+        ),
+
+        br(),
+        div(class = "tooltip-box",
+          tags$small(
+            if(es) paste0("⚙ Método: ", pw$method, " | f² = ", pw$f2,
+                          " | α = ", pw$alpha, " | power = ", pw$power)
+            else   paste0("⚙ Method: ", pw$method, " | f² = ", pw$f2,
+                          " | α = ", pw$alpha, " | power = ", pw$power)
+          )
+        ),
+
+        # Practical recommendation
+        div(style = "background:#F3E5F5; border-left:3px solid #7B1FA2; padding:10px; border-radius:4px; margin-top:8px;",
+          tags$b("💡"), " ", prac_msg
+        )
+      ),
+
+      # ── PANEL 2: Actual sample diagnostic ─────────────────────────────────
+      if (!is.na(n_real) && !is.null(cls)) {
+        box(
+          title = if(es) "🩺 Diagnóstico de tu Muestra Actual" else "🩺 Diagnostic of Your Actual Sample",
+          status = cls$color, solidHeader = TRUE, width = NULL,
+
+          fluidRow(
+            column(6,
+              div(style = paste0("background:", switch(cls$color,
+                    "danger"="#FFEBEE", "warning"="#FFFDE7", "info"="#E3F2FD", "success"="#E8F5E9"),
+                    "; border-radius:8px; padding:16px; text-align:center;"),
+                tags$h1(style="margin:0;", cls$icon),
+                tags$h3(style="margin:4px 0;", cls$label),
+                tags$p(paste0("n = ", n_real))
+              )
+            ),
+            column(6,
+              div(style="padding:10px;",
+                tags$b(if(es) "Comparación:" else "Comparison:"), br(), br(),
+                tags$table(class="table table-condensed",
+                  tags$tbody(
+                    tags$tr(tags$td(if(es)"N real" else "Actual N"), tags$td(tags$b(n_real))),
+                    tags$tr(tags$td(if(es)"N mín (power)" else "N min (power)"), tags$td(pw$n_min)),
+                    tags$tr(tags$td(if(es)"N objetivo" else "Target N"), tags$td(pw$n_target)),
+                    if(!is.null(cl)) tags$tr(tags$td(if(es)"N clásico" else "Classical N"), tags$td(cl$n))
+                  )
+                )
+              )
+            )
+          ),
+
+          div(style="background:#fff; border-radius:6px; padding:12px; border:1px solid #ddd; margin-top:8px;",
+            smart
+          )
+        )
+      },
+
+      # ── PANEL 3: Classical sample size (optional) ─────────────────────────
+      if (!is.null(cl)) {
+        box(
+          title = if(es) "📊 Cálculo Clásico de Muestra (Cochran)" else "📊 Classical Sample Size (Cochran)",
+          status = "warning", solidHeader = FALSE, width = NULL, collapsible = TRUE,
+
+          div(class="tooltip-box",
+            tags$b(if(es) "⚠ Rol complementario:" else "⚠ Complementary role:"),
+            if(es) " En PLS-SEM, este cálculo sirve como respaldo poblacional, no como criterio principal."
+            else   " In PLS-SEM, this calculation serves as population-level support, not the primary criterion."
+          ),
+
+          fluidRow(
+            column(6,
+              div(style="background:#FFF8E1; border-radius:8px; padding:14px; text-align:center;",
+                tags$h2(style="color:#F57F17; margin:0;", cl$n),
+                tags$small(if(es) "N mínimo (fórmula Cochran)" else "Minimum N (Cochran formula)")
+              )
+            ),
+            column(6,
+              div(style="padding:10px;",
+                tags$small(
+                  if(es) paste0("Población: ", if(cl$pop_type=="finite") paste0("finita (N=",cl$N_pop,")") else "grande/desconocida",
+                                " | Confianza: ", round(cl$conf*100), "% | Error: ±", round(cl$error*100), "%")
+                  else   paste0("Population: ", if(cl$pop_type=="finite") paste0("finite (N=",cl$N_pop,")") else "large/unknown",
+                                " | Confidence: ", round(cl$conf*100), "% | Error: ±", round(cl$error*100), "%")
+                )
+              )
+            )
+          )
+        )
+      },
+
+      # ── PANEL 4: Auto-generated methodology text ───────────────────────────
+      box(
+        title = if(es) "📝 Reporte Metodológico Automático" else "📝 Auto-Generated Methodology Report",
+        status = "success", solidHeader = TRUE, width = NULL, collapsible = TRUE,
+
+        tags$b(if(es) "🇪🇸 Español — listo para tesis / artículo:" else "🇪🇸 Spanish — ready for thesis/paper:"),
+        br(), br(),
+        div(style="background:#F1F8E9; border-radius:6px; padding:14px; font-size:13px; line-height:1.8; white-space:pre-wrap;",
+          generate_sample_size_report_es(pw, cl, calc$model_detail)
+        ),
+        br(),
+        tags$b(if(es) "🇺🇸 English — ready for paper/article:" else "🇺🇸 English — ready for paper/article:"),
+        br(), br(),
+        div(style="background:#E3F2FD; border-radius:6px; padding:14px; font-size:13px; line-height:1.8; white-space:pre-wrap;",
+          generate_sample_size_report_en(pw, cl, calc$model_detail)
+        ),
+        br(),
+        div(class="tooltip-box",
+          tags$small(
+            if(es) "Referencia: Hair, J. F., Ringle, C. M., & Sarstedt, M. (2022). A Primer on Partial Least Squares Structural Equation Modeling (PLS-SEM) (3rd ed.). Sage."
+            else   "Reference: Hair, J. F., Ringle, C. M., & Sarstedt, M. (2022). A Primer on Partial Least Squares Structural Equation Modeling (PLS-SEM) (3rd ed.). Sage."
+          )
+        )
+      )
+    )
+  })
+
+  # END MÓDULO TAMAÑO DE MUESTRA ─────────────────────────────────────────────
+
 }
 
 shinyApp(ui, server)
