@@ -1,7 +1,7 @@
 # CANCHARI PLS-SEM PRO v2.0 — User Manual
 
 > **Version:** 2.0 | **Engine:** seminr 2.3+ | **License:** MIT License  
-> **Hosted app:** https://canchari.shinyapps.io/canchari-pls-sempro/  
+> **Hosted app:** https://canchari.shinyapps.io/pls-sem-app/ 
 > **Source code:** https://github.com/Miguekikoh89/canchari-pls-sempro
 
 ---
@@ -49,7 +49,7 @@ CANCHARI PLS-SEM PRO is a bilingual (Spanish/English) web application for Partia
 Access the application directly at:
 
 ```
-https://canchari.shinyapps.io/canchari-pls-sempro/
+https://canchari.shinyapps.io/pls-sem-app/
 ```
 
 No R installation required. Works in any modern browser (Chrome, Firefox, Edge, Safari). An internet connection is required.
