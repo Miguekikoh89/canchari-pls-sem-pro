@@ -1,36 +1,46 @@
-# CANCHARI PLS-SEM PRO
+# CANCHARI PLS-SEM PRO v2.0
 
-CANCHARI PLS-SEM PRO is a web-based application developed in R Shiny for Partial Least Squares Structural Equation Modeling (PLS-SEM).
+## Description
 
-## Live application
+CANCHARI PLS-SEM PRO is a web-based application developed in R (Shiny) for Partial Least Squares Structural Equation Modeling (PLS-SEM). The system provides an integrated graphical interface for conducting measurement model assessment, structural model evaluation, and advanced analytical procedures without requiring programming.
 
-https://canchari.shinyapps.io/pls-sem-app/
+This repository accompanies the SoftwareX submission:
+"CANCHARI PLS-SEM PRO: A reproducible web-based application for partial least squares structural equation modeling"
 
-## Features
+---
 
-- Measurement model evaluation
-- Structural model estimation
-- Bootstrapping analysis
-- Predictive assessment (PLS Predict)
-- Measurement invariance testing (MICOM)
-- Multi-group analysis (MGA)
-- Automatic report generation
+## Key Features
 
-## Installation
+- PLS-SEM estimation (reflective models, Mode A)
+- Bootstrapping (bias-corrected, configurable resamples)
+- Measurement model evaluation (AVE, CR, Cronbach’s alpha, HTMT, HTMT2)
+- Structural model evaluation (path coefficients, t-values, p-values, R², f²)
+- Predictive relevance (Q² via blindfolding, PLS Predict)
+- Measurement invariance (MICOM procedure)
+- Multi-group analysis (MGA permutation test)
+- Endogeneity assessment (Gaussian Copula approach)
+- Cluster analysis (k-means on construct scores)
+- Automatic interpretation with visual indicators
+- Export to Word (APA 7), Excel, HTML, and diagrams
 
-Clone the repository:
+---
 
-git clone https://github.com/Miguekikoh89/canchari-por-favor-sem-pro
+## How to Run
 
-Run in R:
+### Option 1 — Web Application
 
-library(shiny)
-runApp()
+Access the hosted version:
+https://canchari.shinyapps.io/canchari-pls-sempro/
 
-## License
+---
 
-MIT License
+### Option 2 — Local Execution
 
-## Author
+```r
+install.packages(c(
+  "shiny","shinydashboard","seminr","officer","flextable",
+  "DiagrammeR","DT","ggplot2","openxlsx","pwr","zip",
+  "dplyr","tidyr","stringr","readxl"
+))
 
-Miguel Ángel Canchari Preciado
+shiny::runApp("app.R")
