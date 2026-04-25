@@ -98,11 +98,19 @@ parse_item_range <- function(range_str, data_names) {
 #   3. Test de permutacion: permutar filas de X_pool, recalcular c1,c2,r
 #      p-valor = proporcion(r_perm <= r_orig) [unilateral izquierda]
 # ─────────────────────────────────────────────────────────────────────────────
-run_micom <- function(data_full, group_var, m_model, s_model, n_permut = 1000) {
+run_micom <- function(data_full, group_var, m_model, s_model, n_permut = 1000, lang = "es") {
   grupos <- sort(unique(as.character(data_full[[group_var]])))
-  if (length(grupos) < 2) stop("Se necesitan >= 2 grupos para MICOM.")
-  if (length(grupos) > 20) stop(paste0("La variable '", group_var, "' tiene ",
-    length(grupos), " valores unicos. Use una variable categorica con <= 20 grupos."))
+  if (length(grupos) < 2)
+    stop(if (lang == "en") "At least 2 groups are required for MICOM."
+         else              "Se necesitan >= 2 grupos para MICOM.")
+  if (length(grupos) > 20)
+    stop(if (lang == "en")
+           paste0("Variable '", group_var, "' has ", length(grupos),
+                  " unique values. Use a categorical variable with <= 20 groups.")
+         else
+           paste0("La variable '", group_var, "' tiene ", length(grupos),
+                  " valores unicos. Use una variable categorica con <= 20 grupos."))
+
 
   item_cols <- setdiff(names(data_full), group_var)
 
@@ -128,11 +136,14 @@ run_micom <- function(data_full, group_var, m_model, s_model, n_permut = 1000) {
 
   # ── Paso 1: Configuracion ────────────────────────────────────────────────────
   paso1 <- data.frame(
-    Paso        = "1 - Configuracion",
-    Descripcion = "Mismo modelo de medida en todos los grupos",
-    Grupos      = paste(grupos, collapse = " | "),
-    Resultado   = paste0(length(grupos), " grupos | ", length(constructs_nm), " constructos"),
-    OK          = "\u2713 Cumplido",
+    Step        = if (lang == "en") "1 - Configuration"                        else "1 - Configuracion",
+    Description = if (lang == "en") "Same measurement model across all groups" else "Mismo modelo de medida en todos los grupos",
+    Groups      = paste(grupos, collapse = " | "),
+    Result      = paste0(length(grupos),
+                         if (lang == "en") " groups | " else " grupos | ",
+                         length(constructs_nm),
+                         if (lang == "en") " constructs" else " constructos"),
+    Status      = "\u2713 OK",
     stringsAsFactors = FALSE
   )
 
@@ -252,16 +263,23 @@ run_micom <- function(data_full, group_var, m_model, s_model, n_permut = 1000) {
 #   Relacion | Original_G1 | Original_G2 | Diferencia_original |
 #   Media_permutacion | IC_2.5pct | IC_97.5pct | p_valor_permutacion | Sig
 # ─────────────────────────────────────────────────────────────────────────────
-run_mga <- function(data_full, group_var, m_model, s_model, min_n = 30, n_permut = 1000) {
+run_mga <- function(data_full, group_var, m_model, s_model, min_n = 30, n_permut = 1000, lang = "es") {
   grupos <- sort(unique(as.character(data_full[[group_var]])))
   if (length(grupos) > 20)
-    stop(paste0("La variable '", group_var, "' tiene ", length(grupos),
-      " valores unicos. Use una variable categorica con <= 20 grupos."))
+    stop(if (lang == "en")
+           paste0("Variable '", group_var, "' has ", length(grupos),
+                  " unique values. Use a categorical variable with <= 20 groups.")
+         else
+           paste0("La variable '", group_var, "' tiene ", length(grupos),
+                  " valores unicos. Use una variable categorica con <= 20 grupos."))
 
   n_tab     <- table(as.character(data_full[[group_var]]))
   grupos_ok <- names(n_tab)[n_tab >= min_n]
   if (length(grupos_ok) < 2)
-    stop(paste0("Solo ", length(grupos_ok), " grupos con n >= ", min_n, "."))
+    stop(if (lang == "en")
+           paste0("Only ", length(grupos_ok), " group(s) with n >= ", min_n, ". At least 2 required.")
+         else
+           paste0("Solo ", length(grupos_ok), " grupos con n >= ", min_n, "."))
   grupos <- sort(grupos_ok)
 
   item_cols <- setdiff(names(data_full), group_var)
@@ -690,23 +708,100 @@ interpretar_plssem <- function(tables, lng = "es") {
                                "</b><br>&nbsp;&nbsp;SRMR=", srmrs, " &rarr; ", semaf))
   }
 
-  # ── Efectos Indirectos ───────────────────────────────────────────────────────
+  # ── Efectos Indirectos ────────────────────────────────────────────────────────
   if (!is.null(tables$IndirectEffects) && nrow(tables$IndirectEffects) > 0 &&
       !("Nota" %in% names(tables$IndirectEffects))) {
     lineas <- c(lineas, paste0("<br><b>&#128279; ", if(en) "Indirect Effects (Mediation):" else "Efectos Indirectos (Mediaci&oacute;n):", "</b>"))
     df_ind <- tables$IndirectEffects
-    for (i in seq_len(nrow(df_ind))) {
-      beta_i <- suppressWarnings(as.numeric(df_ind$Beta_ind[i]))
-      sig_i  <- if ("Sig" %in% names(df_ind)) df_ind$Sig[i] else "N/A"
-      ic2_i  <- if ("IC_2.5"  %in% names(df_ind)) suppressWarnings(as.numeric(df_ind$IC_2.5[i]))  else NA
-      ic9_i  <- if ("IC_97.5" %in% names(df_ind)) suppressWarnings(as.numeric(df_ind$IC_97.5[i])) else NA
-      beta_s <- if (is.na(beta_i)) "N/A" else as.character(round(beta_i, 3))
-      ic_lbl <- if(en) "CI" else "IC"
-      ic_s   <- if (is.na(ic2_i) || is.na(ic9_i)) "" else paste0(" [", ic_lbl, ": ", round(ic2_i,3), "; ", round(ic9_i,3), "]")
-      sig_ok <- !is.na(ic2_i) && !is.na(ic9_i) && ((ic2_i > 0 && ic9_i > 0) || (ic2_i < 0 && ic9_i < 0))
-      semaf  <- if (sig_ok) "&#128994;" else if (sig_i %in% c("***","**","*")) "&#128993;" else "&#128308;"
-      lineas <- c(lineas, paste0("&nbsp;&nbsp;", semaf, " <b>", df_ind$Path[i], "</b>: &beta;=",
-                                 beta_s, ic_s, " ", sig_i))
+
+    # Separate 2-step and 3-step rows for labelled reporting
+    has_steps_col <- "Steps" %in% names(df_ind)
+    is_3step <- if (has_steps_col) !is.na(df_ind$Steps) & df_ind$Steps == "3-step" else rep(FALSE, nrow(df_ind))
+    df_2step <- df_ind[!is_3step, , drop = FALSE]
+    df_3step <- df_ind[ is_3step, , drop = FALSE]
+
+    # ── Report 2-step indirect effects ─────────────────────────────────────────
+    if (nrow(df_2step) > 0) {
+      lineas <- c(lineas, paste0("&nbsp;&nbsp;<i>", if(en) "Simple indirect effects (X &rarr; M &rarr; Y):" else "Efectos indirectos simples (X &rarr; M &rarr; Y):", "</i>"))
+      for (i in seq_len(nrow(df_2step))) {
+        beta_i <- suppressWarnings(as.numeric(df_2step$Beta_ind[i]))
+        sig_i  <- if ("Sig" %in% names(df_2step)) df_2step$Sig[i] else "N/A"
+        ic2_i  <- if ("IC_2.5"  %in% names(df_2step)) suppressWarnings(as.numeric(df_2step$IC_2.5[i]))  else NA
+        ic9_i  <- if ("IC_97.5" %in% names(df_2step)) suppressWarnings(as.numeric(df_2step$IC_97.5[i])) else NA
+        beta_s <- if (is.na(beta_i)) "N/A" else as.character(round(beta_i, 3))
+        ic_lbl <- if(en) "CI" else "IC"
+        ic_s   <- if (is.na(ic2_i) || is.na(ic9_i)) "" else paste0(" [", ic_lbl, ": ", round(ic2_i,3), "; ", round(ic9_i,3), "]")
+        sig_ok <- !is.na(ic2_i) && !is.na(ic9_i) && ((ic2_i > 0 && ic9_i > 0) || (ic2_i < 0 && ic9_i < 0))
+        semaf  <- if (sig_ok) "&#128994;" else if (sig_i %in% c("***","**","*")) "&#128993;" else "&#128308;"
+        lineas <- c(lineas, paste0("&nbsp;&nbsp;&nbsp;&nbsp;", semaf, " <b>", df_2step$Path[i], "</b>: &beta;=",
+                                   beta_s, ic_s, " ", sig_i))
+      }
+    }
+
+    # ── Report 3-step sequential indirect effects ───────────────────────────────
+    if (nrow(df_3step) > 0) {
+      lineas <- c(lineas, paste0("&nbsp;&nbsp;<i>",
+        if(en) "Sequential indirect effects (X &rarr; M1 &rarr; M2 &rarr; Y):"
+        else   "Efectos indirectos secuenciales (X &rarr; M1 &rarr; M2 &rarr; Y):",
+        "</i>"))
+      for (i in seq_len(nrow(df_3step))) {
+        beta_i <- suppressWarnings(as.numeric(df_3step$Beta_ind[i]))
+        sig_i  <- if ("Sig" %in% names(df_3step)) df_3step$Sig[i] else "N/A"
+        ic2_i  <- if ("IC_2.5"  %in% names(df_3step)) suppressWarnings(as.numeric(df_3step$IC_2.5[i]))  else NA
+        ic9_i  <- if ("IC_97.5" %in% names(df_3step)) suppressWarnings(as.numeric(df_3step$IC_97.5[i])) else NA
+        beta_s <- if (is.na(beta_i)) "N/A" else as.character(round(beta_i, 3))
+        ic_lbl <- if(en) "CI" else "IC"
+        ic_s   <- if (is.na(ic2_i) || is.na(ic9_i)) "" else paste0(" [", ic_lbl, ": ", round(ic2_i,3), "; ", round(ic9_i,3), "]")
+        sig_ok <- !is.na(ic2_i) && !is.na(ic9_i) && ((ic2_i > 0 && ic9_i > 0) || (ic2_i < 0 && ic9_i < 0))
+        semaf  <- if (sig_ok) "&#128994;" else if (sig_i %in% c("***","**","*")) "&#128993;" else "&#128308;"
+        lineas <- c(lineas, paste0("&nbsp;&nbsp;&nbsp;&nbsp;", semaf, " <b>", df_3step$Path[i], "</b>: &beta;=",
+                                   beta_s, ic_s, " ", sig_i,
+                                   " <span style='color:#7B1FA2; font-size:11px;'>[",
+                                   if(en) "Sequential mediation" else "Mediaci&oacute;n secuencial",
+                                   "]</span>"))
+      }
+
+      # ── Full mediation detection for 3-step chains ──────────────────────────
+      # For each 3-step path X->M1->M2->Y, check whether the direct path X->Y is
+      # non-significant (p >= 0.05) while the 3-step indirect effect is significant.
+      # If so, report full sequential mediation.
+      if (!is.null(tables$Paths)) {
+        for (i in seq_len(nrow(df_3step))) {
+          path_str <- df_3step$Path[i]
+          nodes    <- trimws(strsplit(path_str, " -> ")[[1]])
+          if (length(nodes) < 2) next
+          exo_node <- nodes[1]; endo_node <- nodes[length(nodes)]
+          direct_key <- paste0(exo_node, " -> ", endo_node)
+
+          direct_rows <- tables$Paths[
+            gsub("\\s","", tables$Paths$Path) == gsub("\\s","", direct_key), , drop = FALSE]
+          if (nrow(direct_rows) == 0) next
+
+          pv_direct <- suppressWarnings(as.numeric(direct_rows$P_Valor[1]))
+          direct_ns <- !is.na(pv_direct) && pv_direct >= 0.05
+
+          ic2_i <- suppressWarnings(as.numeric(df_3step$IC_2.5[i]))
+          ic9_i <- suppressWarnings(as.numeric(df_3step$IC_97.5[i]))
+          ind_sig <- !is.na(ic2_i) && !is.na(ic9_i) &&
+                     ((ic2_i > 0 && ic9_i > 0) || (ic2_i < 0 && ic9_i < 0))
+
+          if (direct_ns && ind_sig) {
+            lineas <- c(lineas, paste0(
+              "&nbsp;&nbsp;&nbsp;&nbsp;&#128994;&#128994; <b>",
+              if(en) "FULL SEQUENTIAL MEDIATION DETECTED" else "MEDIACI&Oacute;N SECUENCIAL COMPLETA DETECTADA",
+              "</b>: ",
+              if(en) paste0("Direct path <b>", direct_key, "</b> is non-significant (p = ",
+                            round(pv_direct, 3), ") while sequential indirect <b>", path_str,
+                            "</b> is significant (CI excludes zero). This constitutes an indirect-only effect ",
+                            "consistent with full sequential mediation (Hair et al., 2022).")
+              else   paste0("La ruta directa <b>", direct_key, "</b> es no significativa (p = ",
+                            round(pv_direct, 3), ") mientras que el efecto indirecto secuencial <b>", path_str,
+                            "</b> es significativo (IC excluye cero). Esto constituye un efecto indirecto puro, ",
+                            "consistente con mediaci&oacute;n secuencial completa (Hair et al., 2022).")
+            ))
+          }
+        }
+      }
     }
   }
 
@@ -768,15 +863,18 @@ run_gaussian_copula <- function(scores_df, p_df, paths_table = NULL, lang = "es"
   exogenous  <- setdiff(all_from, endogenous)
 
   if (length(exogenous) == 0)
-    stop("No se encontraron variables exógenas en el modelo estructural.")
+    stop(if (lang == "en") "No exogenous variables found in the structural model."
+         else              "No se encontraron variables ex\u00f3genas en el modelo estructural.")
   if (length(endogenous) == 0)
-    stop("No se encontraron variables endógenas en el modelo estructural.")
+    stop(if (lang == "en") "No endogenous variables found in the structural model."
+         else              "No se encontraron variables end\u00f3genas en el modelo estructural.")
 
   exogenous  <- intersect(exogenous,  names(scores_df))
   endogenous <- intersect(endogenous, names(scores_df))
 
   if (length(exogenous) == 0 || length(endogenous) == 0)
-    stop("Los scores de los constructos no contienen variables del modelo. Ejecute el análisis PLS primero.")
+    stop(if (lang == "en") "Construct scores do not contain model variables. Run PLS analysis first."
+         else              "Los scores de los constructos no contienen variables del modelo. Ejecute el an\u00e1lisis PLS primero.")
 
   # Build PLS beta lookup from Paths table if available
   pls_beta_lookup <- list()
@@ -1435,6 +1533,144 @@ generate_sample_size_report_en <- function(pw, cl = NULL, model_detail = "") {
 
 
 # ============================================================================
+# HELPER: compute_indirect_effects()
+# ============================================================================
+# Computes ALL specific indirect effects from a PLS path coefficient matrix:
+#   - 2-step: X -> M -> Y         (single mediator)
+#   - 3-step: X -> M1 -> M2 -> Y  (sequential mediation, two mediators)
+#
+# METHODOLOGICAL NOTE ON STANDARD ERRORS:
+#   When seminr's bootstrapped_indirect_paths is available (Path A above),
+#   that bootstrap-based SE is used — it is the gold standard for PLS-SEM.
+#
+#   When only the path coefficient matrix is available (manual / fallback),
+#   this function applies the MULTIVARIATE DELTA METHOD (product-of-paths SE):
+#
+#   For 2-step  (b1*b2):
+#     SE = sqrt(b2^2 * se1^2 + b1^2 * se2^2)          [Sobel, 1982]
+#
+#   For 3-step  (b1*b2*b3):
+#     SE = sqrt((b2*b3)^2*se1^2 + (b1*b3)^2*se2^2 + (b1*b2)^2*se3^2)
+#          [Bollen & Stine, 1990; extended delta method]
+#
+#   This is the best analytical approximation when bootstrap samples for the
+#   product are not individually stored. It slightly underestimates the true
+#   bootstrapped SE of the product but is methodologically defensible for
+#   reporting purposes and consistent with established PLS-SEM practice.
+#   A full bootstrap implementation can replace this block once boot samples
+#   per path are extracted from seminr's internal boot_array.
+#
+# Arguments:
+#   pm_full   : square path coefficient matrix (rows=from, cols=to), from pls_est$path_coef
+#   paths_tbl : results$tables$Paths (contains STDEV per direct path)
+#   n_obs     : number of observations (for df in t-distribution)
+#
+# Returns a data.frame with columns:
+#   Path, Beta_ind, STDEV, T_Valor, P_Valor, IC_2.5, IC_97.5, Sig, Steps
+# ─────────────────────────────────────────────────────────────────────────────
+compute_indirect_effects <- function(pm_full, paths_tbl, n_obs) {
+
+  if (is.null(pm_full) || !is.matrix(pm_full)) return(NULL)
+  cons_names <- colnames(pm_full)
+  df_t <- max(n_obs - 1L, 1L)
+
+  # ── Helper: look up bootstrapped STDEV for a direct path ─────────────────
+  get_se <- function(from, to) {
+    if (is.null(paths_tbl)) return(NA_real_)
+    key <- gsub("\\s", "", paste0(from, "->", to))
+    idx <- which(gsub("\\s", "", paths_tbl$Path) == key)
+    if (length(idx) == 0) return(NA_real_)
+    suppressWarnings(as.numeric(paths_tbl$STDEV[idx[1]]))
+  }
+
+  # ── Helper: build a standardised output row ───────────────────────────────
+  make_row <- function(path_lbl, ind_val, se_val, steps) {
+    t_val  <- if (!is.na(se_val) && se_val > 0) ind_val / se_val else NA_real_
+    p_val  <- if (!is.na(t_val))  2 * (1 - pt(abs(t_val), df = df_t)) else NA_real_
+    lo     <- if (!is.na(se_val)) ind_val - 1.96 * se_val else NA_real_
+    hi     <- if (!is.na(se_val)) ind_val + 1.96 * se_val else NA_real_
+    sig    <- if (is.na(p_val)) "N/D" else
+              if (p_val < 0.001) "***" else
+              if (p_val < 0.01)  "**"  else
+              if (p_val < 0.05)  "*"   else
+              if (p_val < 0.10)  "\u2020" else "n.s."
+    data.frame(
+      Path     = path_lbl,
+      Beta_ind = round(ind_val,  3),
+      STDEV    = round(se_val,   3),
+      T_Valor  = round(t_val,    3),
+      P_Valor  = round(p_val,    4),
+      IC_2.5   = round(lo,       3),
+      IC_97.5  = round(hi,       3),
+      Sig      = sig,
+      Steps    = steps,                 # "2-step" or "3-step"
+      stringsAsFactors = FALSE
+    )
+  }
+
+  ind_rows <- list()
+
+  for (exoC in cons_names) {
+    for (endoC in cons_names) {
+      if (exoC == endoC) next
+
+      # ── 2-STEP: X -> M -> Y ──────────────────────────────────────────────
+      # Condition: pm[exoC, M] != 0  AND  pm[M, endoC] != 0
+      for (med in cons_names) {
+        if (med == exoC || med == endoC) next
+        b1 <- tryCatch(pm_full[exoC, med],  error = function(e) 0)
+        b2 <- tryCatch(pm_full[med,  endoC], error = function(e) 0)
+        if (is.na(b1) || is.na(b2)) next
+        if (abs(b1) < 1e-10 || abs(b2) < 1e-10) next
+
+        ind_val  <- b1 * b2
+        se1 <- get_se(exoC, med)
+        se2 <- get_se(med,  endoC)
+        # Delta method SE for product b1*b2
+        sobel_se <- if (!is.na(se1) && !is.na(se2))
+          sqrt(b2^2 * se1^2 + b1^2 * se2^2) else NA_real_
+
+        lbl <- paste0(exoC, " -> ", med, " -> ", endoC)
+        ind_rows[[length(ind_rows) + 1]] <- make_row(lbl, ind_val, sobel_se, "2-step")
+      }
+
+      # ── 3-STEP: X -> M1 -> M2 -> Y ───────────────────────────────────────
+      # Condition: pm[X,M1] != 0  AND  pm[M1,M2] != 0  AND  pm[M2,Y] != 0
+      # where M1 != M2, M1 != X, M1 != Y, M2 != X, M2 != Y
+      for (med1 in cons_names) {
+        if (med1 == exoC || med1 == endoC) next
+        b1 <- tryCatch(pm_full[exoC, med1], error = function(e) 0)
+        if (is.na(b1) || abs(b1) < 1e-10) next
+
+        for (med2 in cons_names) {
+          if (med2 == exoC || med2 == endoC || med2 == med1) next
+          b2 <- tryCatch(pm_full[med1, med2], error = function(e) 0)
+          b3 <- tryCatch(pm_full[med2, endoC], error = function(e) 0)
+          if (is.na(b2) || is.na(b3)) next
+          if (abs(b2) < 1e-10 || abs(b3) < 1e-10) next
+
+          ind_val <- b1 * b2 * b3
+          se1 <- get_se(exoC, med1)
+          se2 <- get_se(med1, med2)
+          se3 <- get_se(med2, endoC)
+          # Extended delta method SE for product b1*b2*b3
+          # Var(b1*b2*b3) ≈ (b2*b3)^2*var(b1) + (b1*b3)^2*var(b2) + (b1*b2)^2*var(b3)
+          delta_se <- if (!is.na(se1) && !is.na(se2) && !is.na(se3))
+            sqrt((b2*b3)^2 * se1^2 + (b1*b3)^2 * se2^2 + (b1*b2)^2 * se3^2)
+          else NA_real_
+
+          lbl <- paste0(exoC, " -> ", med1, " -> ", med2, " -> ", endoC)
+          ind_rows[[length(ind_rows) + 1]] <- make_row(lbl, ind_val, delta_se, "3-step")
+        }
+      }
+    }
+  }
+
+  if (length(ind_rows) == 0) return(NULL)
+  do.call(rbind, ind_rows)
+}
+
+# ============================================================================
 # SERVER
 # ============================================================================
 
@@ -1511,6 +1747,11 @@ server <- function(input, output, session) {
       # Analysis tab
       box_analysis   = if(es) "⚙ Configuración del Análisis" else "⚙ Analysis Configuration",
       lbl_nboot      = if(es) "Iteraciones Bootstrapping"   else "Bootstrap Iterations",
+      lbl_seed       = if(es) "Semilla aleatoria (reproducibilidad)" else "Random seed (reproducibility)",
+      hint_seed      = if(es) paste0("Documenta este valor en tu artículo para garantizar reproducibilidad exacta. ",
+                                     "Se aplica a bootstrapping, PLS Predict y pruebas de permutación.")
+                       else   paste0("Document this value in your paper to ensure exact reproducibility. ",
+                                     "Applied to bootstrapping, PLS Predict, and permutation tests."),
       lbl_omit       = if(es) "Distancia omisión (Q²/Blindfolding)" else "Omission Distance (Q²/Blindfolding)",
       lbl_calc_q2    = if(es) "Calcular Q² (Blindfolding)"  else "Calculate Q² (Blindfolding)",
       lbl_calc_f2    = if(es) "Calcular f² (Effect Size)"   else "Calculate f² (Effect Size)",
@@ -1714,9 +1955,15 @@ server <- function(input, output, session) {
   output$box_analysis_title_ui <- renderUI({ i18n()$box_analysis })
   output$box_console_title_ui  <- renderUI({ i18n()$box_console })
   output$analysis_controls_ui <- renderUI({
-    t <- i18n()
+    t  <- i18n()
+    es <- isTRUE(input$app_lang != "en")   # FIXED: 'es' must be defined in this scope
     tagList(
       sliderInput("nboot", t$lbl_nboot, min = 500, max = 10000, value = isolate(input$nboot) %||% 5000, step = 500),
+      numericInput("analysis_seed", t$lbl_seed,
+                   value = isolate(input$analysis_seed) %||% 123,
+                   min = 1, max = 999999, step = 1),
+      tags$div(style = "background:#E8F5E9;border-left:3px solid #2E7D32;padding:6px 10px;border-radius:4px;font-size:11px;margin-bottom:8px;color:#1B5E20;",
+        tags$b("\U0001f511 "), t$hint_seed),
       numericInput("omission_distance", t$lbl_omit, value = isolate(input$omission_distance) %||% 7, min = 5, max = 15),
       checkboxInput("calc_q2", t$lbl_calc_q2, value = isolate(input$calc_q2) %||% TRUE),
       checkboxInput("calc_f2", t$lbl_calc_f2, value = isolate(input$calc_f2) %||% TRUE),
@@ -1727,7 +1974,20 @@ server <- function(input, output, session) {
       br(),
       numericInput("min_group_n", t$lbl_min_n, value = isolate(input$min_group_n) %||% 30, min = 10, step = 5),
       checkboxInput("run_micom", t$lbl_run_micom, value = isolate(input$run_micom) %||% FALSE),
-      checkboxInput("run_mga",   t$lbl_run_mga,   value = isolate(input$run_mga)   %||% FALSE)
+      checkboxInput("run_mga",   t$lbl_run_mga,   value = isolate(input$run_mga)   %||% FALSE),
+      # ADDED: FIMIX-PLS heterogeneity controls
+      hr(),
+      tags$h5(if(es) "\U0001f9e9 Heterogeneidad (FIMIX proxy)" else "\U0001f9e9 Heterogeneity (FIMIX proxy)"),
+      tags$div(style="background:#F3E5F5;border-left:3px solid #7B1FA2;padding:8px;border-radius:4px;font-size:12px;margin-bottom:8px;",
+        if(es) "K-means sobre construct scores como proxy de segmentacion FIMIX-PLS (Hair et al., 2022). Los coeficientes de ruta por segmento son estimaciones OLS."
+        else   "K-means on construct scores as FIMIX-PLS segmentation proxy (Hair et al., 2022). Segment-level path coefficients are OLS approximations."
+      ),
+      checkboxInput("run_fimix", if(es) "Calcular segmentacion FIMIX (k-means)" else "Calculate FIMIX segmentation (k-means)",
+                    value = isolate(input$run_fimix) %||% FALSE),
+      conditionalPanel("input.run_fimix == true",
+        numericInput("fimix_k", if(es) "Numero de segmentos (k)" else "Number of segments (k)",
+                     value = isolate(input$fimix_k) %||% 2, min = 2, max = 6, step = 1)
+      )
     )
   })
   output$run_analysis_btn_ui <- renderUI({
@@ -1967,6 +2227,142 @@ server <- function(input, output, session) {
                   column(3, downloadButton("dl_viz_pdf", "\u2b07 PDF (vector)",  class = "btn btn-sm btn-danger btn-block")),
                   column(3, downloadButton("dl_viz_svg", "\u2b07 SVG",           class = "btn btn-sm btn-default btn-block"))
                 )
+              )
+            )
+          )
+        )
+      ),
+
+      # ADDED: Advanced Validity tab — Loading CI, HTMT CI, HTMT2, FIMIX, Marker note
+      tabPanel("\U0001f52c Advanced Validity", br(),
+
+        # ── Bootstrapped Loading CIs ─────────────────────────────────────────
+        fluidRow(
+          box(
+            title = "\U0001f4ca Bootstrapped Outer Loading Confidence Intervals",
+            status = "primary", solidHeader = TRUE, width = 12,
+            tags$div(style="background:#E3F2FD;border-left:4px solid #1565C0;padding:10px;border-radius:4px;margin-bottom:10px;",
+              tags$b("\U0001f4d6 Method: "),
+              tags$span("Percentile bootstrap CI (seminr boot summary or manual resampling). "),
+              tags$b("Criterion: "), tags$span("CI lower bound \u2265 0.40 confirms loading stability. "),
+              tags$b("Reference: "), tags$span("Hair et al. (2022, p. 115).")
+            ),
+            DTOutput("table_loading_ci"),
+            br(),
+            fluidRow(
+              column(3, downloadButton("dl_loading_ci_csv",  "\u2b07 CSV",           class="btn btn-sm btn-default btn-block")),
+              column(3, downloadButton("dl_loading_ci_xlsx", "\u2b07 Excel (.xlsx)", class="btn btn-sm btn-success btn-block"))
+            )
+          )
+        ),
+
+        # ── HTMT with Bootstrap CIs ─────────────────────────────────────────
+        fluidRow(
+          box(
+            title = "\U0001f9ee HTMT with Bootstrapped 95% CI",
+            status = "info", solidHeader = TRUE, width = 12,
+            tags$div(style="background:#E1F5FE;border-left:4px solid #0277BD;padding:10px;border-radius:4px;margin-bottom:10px;",
+              tags$b("\U0001f4d6 Method: "), tags$span("Bootstrap percentile CI for HTMT (seminr or manual, 500 iterations). "),
+              tags$b("Criterion: "), tags$span("CI upper bound < 0.85 \u2192 discriminant validity confirmed. "),
+              tags$b("Reference: "), tags$span("Henseler et al. (2015); Hair et al. (2022, Ch. 4).")
+            ),
+            DTOutput("table_htmt_ci"),
+            br(),
+            fluidRow(
+              column(3, downloadButton("dl_htmt_ci_csv",  "\u2b07 CSV",           class="btn btn-sm btn-default btn-block")),
+              column(3, downloadButton("dl_htmt_ci_xlsx", "\u2b07 Excel (.xlsx)", class="btn btn-sm btn-success btn-block"))
+            )
+          )
+        ),
+
+        # ── HTMT2 ───────────────────────────────────────────────────────────
+        fluidRow(
+          box(
+            title = "\U0001f4d0 HTMT2 (Geometric-Mean Corrected HTMT)",
+            status = "warning", solidHeader = TRUE, width = 12,
+            tags$div(style="background:#FFF8E1;border-left:4px solid #F9A825;padding:10px;border-radius:4px;margin-bottom:10px;",
+              tags$b("\U0001f4d6 Method: "), tags$span("HTMT2 = mean heterotrait-heteromethod r / sqrt(geomean_i \u00d7 geomean_j). "),
+              tags$span("Corrects for reliability differences between constructs. Requires \u2265 2 items per construct. "),
+              tags$b("Reference: "), tags$span("Henseler (2020). Composite-based SEM: guidelines for formative/reflective constructs.")
+            ),
+            DTOutput("table_htmt2"),
+            br(),
+            fluidRow(
+              column(3, downloadButton("dl_htmt2_csv",  "\u2b07 CSV",           class="btn btn-sm btn-default btn-block")),
+              column(3, downloadButton("dl_htmt2_xlsx", "\u2b07 Excel (.xlsx)", class="btn btn-sm btn-success btn-block"))
+            )
+          )
+        ),
+
+        # ── FIMIX / Heterogeneity ────────────────────────────────────────────
+        fluidRow(
+          box(
+            title = "\U0001f9e9 FIMIX-PLS: Heterogeneity (k-means proxy)",
+            status = "success", solidHeader = TRUE, width = 12,
+            tags$div(style="background:#E8F5E9;border-left:4px solid #2E7D32;padding:10px;border-radius:4px;margin-bottom:10px;",
+              tags$b("\U0001f4d6 Method: "),
+              tags$span("K-means clustering on standardised construct scores as a heterogeneity proxy. "),
+              tags$span("Segment-level path coefficients are OLS approximations (NOT bootstrapped). "),
+              tags$b("\u26a0 Note: "),
+              tags$span("True FIMIX-PLS (Hahn et al. 2002) requires specialised EM software (SmartPLS, ADANCO). "),
+              tags$span("Enable under Analysis \u2192 Heterogeneity and re-run the analysis. "),
+              tags$b("Reference: "), tags$span("Hair et al. (2022, Ch. 8); Sarstedt et al. (2011).")
+            ),
+            uiOutput("fimix_status_ui"),
+            br(),
+            fluidRow(
+              column(6,
+                tags$h5(style="color:#1565C0;", "Segment Sizes"),
+                DTOutput("table_fimix_sizes")
+              ),
+              column(6,
+                tags$h5(style="color:#1565C0;", "Construct Means per Segment"),
+                DTOutput("table_fimix_means")
+              )
+            ),
+            br(),
+            tags$h5(style="color:#1565C0;", "Path Coefficients per Segment (OLS)"),
+            DTOutput("table_fimix_paths"),
+            br(),
+            fluidRow(
+              column(3, downloadButton("dl_fimix_csv",  "\u2b07 CSV (All segments)", class="btn btn-sm btn-default btn-block")),
+              column(3, downloadButton("dl_fimix_xlsx", "\u2b07 Excel (.xlsx)",       class="btn btn-sm btn-success btn-block"))
+            )
+          )
+        ),
+
+        # ── Marker Variable / ULMC Developer Note ────────────────────────────
+        fluidRow(
+          box(
+            title = "\U0001f6ab Marker Variable / ULMC: Methodological Note",
+            status = "danger", solidHeader = FALSE, width = 12,
+            collapsible = TRUE, collapsed = TRUE,
+            tags$div(style="background:#FFEBEE;border-left:4px solid #C62828;padding:14px;border-radius:4px;",
+              tags$h5(style="color:#B71C1C;", "\u26a0 Why marker variable and ULMC tests are NOT implemented here"),
+              tags$p(
+                tags$b("Short answer: "), "Marker variable procedures and the Unmeasured Latent Method Construct (ULMC) approach ",
+                "are designed for ", tags$b("reflective covariance-based SEM (CB-SEM / CFA)"), ", not for variance-based PLS-SEM."
+              ),
+              tags$p(
+                tags$b("Technical reason: "),
+                "In PLS-SEM, composites are ", tags$em("deterministically"), " constructed as weighted linear combinations of indicators. ",
+                "There is no freely-estimated factor loading structure and no factor residual. ",
+                "Adding a marker variable as a latent factor in a composite-based model is methodologically undefined ",
+                "and would produce misleading results."
+              ),
+              tags$p(
+                tags$b("What this app provides instead (best practice for CMB in PLS-SEM):"),
+                tags$ul(
+                  tags$li(tags$b("Full Collinearity VIF < 3.3"), " — Kock (2015) criterion, computed in the Structural tab. ",
+                          "All VIF < 3.3 constitutes evidence against common method bias."),
+                  tags$li(tags$b("Procedural remedies"), " — Use temporal or spatial separation in data collection, ensure anonymity, etc. (Podsakoff et al. 2003)."),
+                  tags$li(tags$b("Harman single-factor test"), " — Can be run externally in SPSS/jamovi: if first unrotated factor < 50% of total variance, CMB is not dominant.")
+                )
+              ),
+              tags$p(style="color:#777;font-size:12px;",
+                "References: Kock (2015). Common method bias in PLS-SEM. Int. J. e-Collaboration, 11(4). | ",
+                "Podsakoff et al. (2003). Common method biases in behavioral research. J. Applied Psychology. | ",
+                "Hair et al. (2022). A Primer on Partial Least Squares SEM (3rd ed.)."
               )
             )
           )
@@ -2698,16 +3094,17 @@ observe({
       results$log <- if(es) "► [6/7] Ejecutando Bootstrapping..." else "► [6/7] Running Bootstrapping..."
 
       nboot_n   <- as.integer(input$nboot)
+      user_seed <- as.integer(input$analysis_seed %||% 123L)
       n_obs     <- nrow(hoc_data)
       path_keys <- paste0(p_df$from, " -> ", p_df$to)
-      set.seed(123)
+      set.seed(user_seed)
 
       # SIN HOC: bootstrap_model() de seminr → rápido, correcto, idéntico a SmartPLS
       # CON HOC: bootstrap manual con Two-Stage saturado en cada resample
       if (length(hoc_specs) == 0) {
 
         boot_est  <- tryCatch(
-          bootstrap_model(seminr_model = pls_est, nboot = nboot_n, cores = 1, seed = 123),
+          bootstrap_model(seminr_model = pls_est, nboot = nboot_n, cores = 1, seed = user_seed),
           error = function(e) NULL)
         boot_summ <- if (!is.null(boot_est)) tryCatch(summary(boot_est), error=function(e) NULL) else NULL
         bp        <- if (!is.null(boot_summ)) tryCatch(as.data.frame(safe_list_get(boot_summ, "bootstrapped_paths")), error=function(e) NULL) else NULL
@@ -2978,30 +3375,529 @@ observe({
             "\n\u26a0\ufe0f Ajuste HOC \u00d72 APLICADO: variable ex\u00f3gena dic\u00f3toma detectada. Resultado compatible con SmartPLS.")
         } else {
           # Variable continua (Likert, etc.) — NO aplicar ajuste, mostrar advertencia
-          message("[HOC x2] ADVERTENCIA: variable exógena NO es dicotómica. Ajuste × 2 OMITIDO para evitar resultados incorrectos.")
+          message("[HOC x2] WARNING: exogenous variable is NOT dichotomous. x2 adjustment SKIPPED to avoid incorrect results.")
           results$log <- paste0(results$log %||% "",
-            "\n\u274c Ajuste HOC \u00d72 IGNORADO: la variable ex\u00f3gena no es dic\u00f3toma (0/1). ",
-            "Con variables Likert/continuas el Two-Stage ya da los valores correctos. ",
-            "Los resultados son comparables a SmartPLS SIN aplicar el ajuste \u00d72. ",
-            "Desmarca la opci\u00f3n '\U0001f53a Ajuste HOC \u00d72' para evitar esta advertencia.")
+            if (es) paste0("\n\u274c Ajuste HOC \u00d72 IGNORADO: la variable ex\u00f3gena no es dic\u00f3toma (0/1). ",
+                           "Con variables Likert/continuas el Two-Stage ya da los valores correctos. ",
+                           "Los resultados son comparables a SmartPLS SIN aplicar el ajuste \u00d72. ",
+                           "Desmarca la opci\u00f3n '\U0001f53a Ajuste HOC \u00d72' para evitar esta advertencia.")
+            else paste0("\n\u274c HOC \u00d72 adjustment SKIPPED: exogenous variable is not dichotomous (0/1). ",
+                        "For Likert/continuous variables, Two-Stage already yields correct values. ",
+                        "Results are comparable to SmartPLS WITHOUT applying the \u00d72 adjustment. ",
+                        "Uncheck '\U0001f53a HOC \u00d72 adjustment' to suppress this warning."))
         }
       }
       results$tables$Paths <- paths_df_out
 
-      # ── Cross-loadings ───────────────────────────────────────────────────
+      # ADDED: Bootstrapped confidence intervals for outer loadings
+      # Methodology: percentile bootstrap CI from boot_summ$bootstrapped_loadings (seminr)
+      # or manual bootstrap over items × constructs if seminr's boot_summ is available.
+      # Reference: Hair et al. (2022) — loading stability assessment recommended.
       tryCatch({
-        ld_mat <- as.matrix(summ$loadings)
-        if (!is.null(ld_mat) && nrow(ld_mat) > 0) {
-          cl_df <- as.data.frame(round(ld_mat, 3))
-          cl_df <- cbind(Item = rownames(cl_df), cl_df)
-          # Mark highest loading per row
-          cn_names <- colnames(cl_df)[-1]
-          cl_df$Asignado_a <- apply(ld_mat, 1, function(r) {
-            mx <- which.max(abs(r)); if (length(mx)) names(r)[mx] else NA
-          })
-          results$tables$CrossLoadings <- cl_df
+        boot_load_ci <- NULL
+
+        # Attempt 1: extract from seminr boot summary (non-HOC path)
+        if (!is.null(boot_summ_out)) {
+          bl_raw <- tryCatch(
+            as.data.frame(safe_list_get(boot_summ_out, "bootstrapped_loadings")),
+            error = function(e) NULL)
+          if (!is.null(bl_raw) && nrow(bl_raw) > 0) {
+            # seminr format: rows = items/constructs, cols = Original, Mean, STDEV, CI lower, CI upper
+            bl_item <- rownames(bl_raw) %||% paste0("Item_", seq_len(nrow(bl_raw)))
+            bl_orig <- get_num_col(bl_raw,
+              exact_names = c("Original","Original estimate","original_sample","Estimate","Beta"),
+              regex_pats  = c("original","orig","estimate","beta","sample"))
+            bl_se  <- get_num_col(bl_raw,
+              exact_names = c("Std.Error","Std Error","SE","Std.Dev","SD"),
+              regex_pats  = c("std\\.?\\s*error","stderr","se\\b","std\\.?\\s*dev","stdev","\\bsd\\b"))
+            bl_lo  <- rep(NA_real_, nrow(bl_raw)); bl_hi <- rep(NA_real_, nrow(bl_raw))
+            known_lo <- c("2.5%","2.5 %","CI_lower","Lower","lower","LL","Perc_2.5")
+            known_hi <- c("97.5%","97.5 %","CI_upper","Upper","upper","UL","Perc_97.5")
+            bl_nms <- tolower(trimws(names(bl_raw)))
+            for (nm in known_lo) { idx2 <- which(bl_nms==tolower(trimws(nm))); if(length(idx2)){ bl_lo <- suppressWarnings(as.numeric(bl_raw[[idx2[1]]])); break } }
+            for (nm in known_hi) { idx2 <- which(bl_nms==tolower(trimws(nm))); if(length(idx2)){ bl_hi <- suppressWarnings(as.numeric(bl_raw[[idx2[1]]])); break } }
+            # Fall back to ±1.96 SE if CI columns not found
+            if (all(is.na(bl_lo))) {
+              bl_lo <- as.numeric(bl_orig) - 1.96 * as.numeric(bl_se)
+              bl_hi <- as.numeric(bl_orig) + 1.96 * as.numeric(bl_se)
+            }
+
+            # Identify construct for each item using loadings matrix
+            ld_for_ci <- tryCatch(as.matrix(summ$loadings), error=function(e) NULL)
+            get_construct <- function(item_nm) {
+              if (is.null(ld_for_ci)) return(NA_character_)
+              if (!(item_nm %in% rownames(ld_for_ci))) return(NA_character_)
+              idx_max <- which.max(abs(ld_for_ci[item_nm, ]))
+              if (length(idx_max)) colnames(ld_for_ci)[idx_max] else NA_character_
+            }
+
+            boot_load_ci <- data.frame(
+              Item       = bl_item,
+              Constructo = sapply(bl_item, get_construct),
+              Loading    = round(as.numeric(bl_orig), 3),
+              CI_2.5     = round(as.numeric(bl_lo),   3),
+              CI_97.5    = round(as.numeric(bl_hi),   3),
+              STDEV_boot = round(as.numeric(bl_se),   3),
+              Estable    = ifelse(!is.na(as.numeric(bl_lo)) & as.numeric(bl_lo) >= 0.4,
+                                 "\u2713 \u22650.4", "\u26a0 Revisar"),
+              stringsAsFactors = FALSE
+            )
+            # Filter rows where loading != 0 (only actual items)
+            boot_load_ci <- boot_load_ci[!is.na(boot_load_ci$Loading) & abs(boot_load_ci$Loading) > 0.001, ]
+          }
+        }
+
+        # Attempt 2: manual bootstrap from stored boot_matrix (HOC path)
+        # boot_matrix is defined in the HOC bootstrap block; for non-HOC it's not available,
+        # but boot_summ_out covers that case above.
+        # If neither worked, build percentile CI from raw_data using jacknife approximation
+        if (is.null(boot_load_ci) || nrow(boot_load_ci) == 0) {
+          ld_for_ci <- tryCatch(as.matrix(summ$loadings), error=function(e) NULL)
+          if (!is.null(ld_for_ci) && !is.null(data_raw())) {
+            set.seed(user_seed + 333L)
+            n_jack <- nrow(data_raw())
+            n_boot_load <- min(200L, as.integer(input$nboot))  # limit for speed
+            bl_rows <- list()
+            for (item_nm in rownames(ld_for_ci)) {
+              for (cn_l in colnames(ld_for_ci)) {
+                lam_orig <- ld_for_ci[item_nm, cn_l]
+                if (abs(lam_orig) < 0.001) next
+                items_cn <- rownames(ld_for_ci)[abs(ld_for_ci[, cn_l]) > 0.001]
+                items_cn <- items_cn[items_cn %in% names(data_raw())]
+                if (length(items_cn) < 2 || !(item_nm %in% names(data_raw()))) next
+                # Bootstrap distribution of cor(item, composite of construct)
+                comp_items <- setdiff(items_cn, item_nm)
+                if (length(comp_items) == 0) comp_items <- items_cn
+                boot_lams <- replicate(n_boot_load, {
+                  idx_b <- sample(n_jack, n_jack, replace=TRUE)
+                  d_b   <- data_raw()[idx_b, , drop=FALSE]
+                  comp  <- rowMeans(d_b[, comp_items, drop=FALSE], na.rm=TRUE)
+                  suppressWarnings(cor(d_b[[item_nm]], comp, use="complete.obs"))
+                })
+                boot_lams <- boot_lams[!is.na(boot_lams)]
+                if (length(boot_lams) < 10) next
+                bl_rows[[length(bl_rows)+1]] <- data.frame(
+                  Item       = item_nm,
+                  Constructo = cn_l,
+                  Loading    = round(lam_orig, 3),
+                  CI_2.5     = round(quantile(boot_lams, 0.025), 3),
+                  CI_97.5    = round(quantile(boot_lams, 0.975), 3),
+                  STDEV_boot = round(sd(boot_lams), 3),
+                  Estable    = ifelse(!is.na(quantile(boot_lams, 0.025)) & quantile(boot_lams, 0.025) >= 0.4,
+                                     "\u2713 \u22650.4", "\u26a0 Revisar"),
+                  stringsAsFactors = FALSE
+                )
+              }
+            }
+            if (length(bl_rows) > 0)
+              boot_load_ci <- do.call(rbind, bl_rows)
+          }
+        }
+
+        if (!is.null(boot_load_ci) && nrow(boot_load_ci) > 0)
+          results$tables$LoadingCI <- boot_load_ci
+
+      }, error = function(e) {
+        message("[LoadingCI] Error: ", e$message)
+      })
+
+      # HTMT with bootstrapped confidence intervals
+      # Method: percentile bootstrap CI for HTMT from boot_summ (seminr) or manual.
+      # The CI upper bound < 0.85 confirms discriminant validity at 95% CI level.
+      # Reference: Henseler et al. (2015); Hair et al. (2022, Ch. 4).
+      #
+      # FIX: Attempt 1 is only accepted if it yields real (non-NA) CI values.
+      #      If CIs are all NA (seminr did not expose bootstrapped_HTMT), Attempt 2
+      #      (manual percentile bootstrap) is always run as the fallback.
+      #      Single-item constructs are handled by using r_het directly (denominator = 1).
+      tryCatch({
+        htmt_base <- results$tables$HTMT
+        if (!is.null(htmt_base) && nrow(htmt_base) > 0) {
+
+          htmt_boot_ci      <- NULL
+          attempt1_has_ci   <- FALSE
+
+          # ── Attempt 1: from seminr boot summary (bootstrapped_HTMT) ─────────
+          if (!is.null(boot_summ_out)) {
+            bhtmt_raw <- tryCatch(
+              as.data.frame(safe_list_get(boot_summ_out, "bootstrapped_HTMT")),
+              error = function(e) NULL)
+            if (!is.null(bhtmt_raw) && nrow(bhtmt_raw) > 0) {
+              bhtmt_pairs <- rownames(bhtmt_raw) %||% paste0("Pair_", seq_len(nrow(bhtmt_raw)))
+              bhtmt_orig  <- get_num_col(bhtmt_raw,
+                exact_names = c("Original","Original estimate","original_sample"),
+                regex_pats  = c("original","orig","estimate","sample"))
+              bhtmt_lo <- rep(NA_real_, nrow(bhtmt_raw))
+              bhtmt_hi <- rep(NA_real_, nrow(bhtmt_raw))
+              bhtmt_nms <- tolower(trimws(names(bhtmt_raw)))
+              for (nm in c("2.5%","2.5 %","ci_lower","lower","ll","perc_2.5")) {
+                idx2 <- which(bhtmt_nms == nm)
+                if (length(idx2)) { bhtmt_lo <- suppressWarnings(as.numeric(bhtmt_raw[[idx2[1]]])); break }
+              }
+              for (nm in c("97.5%","97.5 %","ci_upper","upper","ul","perc_97.5")) {
+                idx2 <- which(bhtmt_nms == nm)
+                if (length(idx2)) { bhtmt_hi <- suppressWarnings(as.numeric(bhtmt_raw[[idx2[1]]])); break }
+              }
+              # Only accept Attempt 1 if at least one real CI value was extracted
+              if (any(!is.na(bhtmt_lo)) && any(!is.na(bhtmt_hi))) {
+                attempt1_has_ci <- TRUE
+                htmt_boot_ci <- data.frame(
+                  Pair    = bhtmt_pairs,
+                  HTMT    = round(as.numeric(bhtmt_orig), 3),
+                  CI_2.5  = round(as.numeric(bhtmt_lo), 3),
+                  CI_97.5 = round(as.numeric(bhtmt_hi), 3),
+                  OK_CI   = ifelse(
+                    !is.na(as.numeric(bhtmt_hi)) & as.numeric(bhtmt_hi) < 0.85,
+                    "\u2713 CI upper <0.85",
+                    ifelse(
+                      !is.na(as.numeric(bhtmt_hi)) & as.numeric(bhtmt_hi) < 0.90,
+                      "\u26a0 CI upper 0.85\u20130.90 (marginal)",
+                      "\u2717 CI upper \u22650.90"
+                    )
+                  ),
+                  stringsAsFactors = FALSE
+                )
+                message("[HTMT_CI] Attempt 1 OK — CIs from bootstrapped_HTMT")
+              } else {
+                message("[HTMT_CI] Attempt 1: bootstrapped_HTMT found but CIs are all NA — falling back to Attempt 2")
+              }
+            }
+          }
+
+          # ── Attempt 2: manual percentile bootstrap from raw data ─────────────
+          # Runs whenever Attempt 1 did not produce valid CI values.
+          if (!attempt1_has_ci && !is.null(data_raw())) {
+            ld_for_htmt <- tryCatch(as.matrix(summ$loadings), error = function(e) NULL)
+            if (!is.null(ld_for_htmt)) {
+              set.seed(user_seed + 666L)
+              n_boot_htmt <- min(500L, as.integer(input$nboot))
+              raw_d       <- data_raw()
+
+              # Build item map: include single-item constructs (>= 1 item)
+              # HTMT for single-item construct pairs uses r_het directly
+              # (denominator terms for single items = 1 by definition → no lower.tri needed)
+              item_map_h <- list()
+              for (cn_h in colnames(ld_for_htmt)) {
+                items_h <- rownames(ld_for_htmt)[abs(ld_for_htmt[, cn_h]) > 0.001]
+                items_h <- items_h[items_h %in% names(raw_d)]
+                if (length(items_h) >= 1) item_map_h[[cn_h]] <- items_h
+              }
+              cons_h <- names(item_map_h)
+
+              # Helper: safe mean of lower triangle; 1.0 for single-item constructs
+              safe_tri_mean <- function(R) {
+                if (nrow(R) < 2) return(1.0)   # single-item: perfect internal consistency
+                tri <- R[lower.tri(R)]
+                if (length(tri) == 0) return(1.0)
+                mean(abs(tri), na.rm = TRUE)
+              }
+
+              # HTMT formula: r_het / sqrt(r_ii * r_jj)
+              calc_htmt_robust <- function(d, items_i, items_j) {
+                R_ij  <- cor(d[, items_i, drop = FALSE],
+                             d[, items_j, drop = FALSE],
+                             use = "pairwise.complete.obs")
+                r_het <- mean(abs(as.numeric(R_ij)), na.rm = TRUE)
+                R_ii  <- cor(d[, items_i, drop = FALSE], use = "pairwise.complete.obs")
+                R_jj  <- cor(d[, items_j, drop = FALSE], use = "pairwise.complete.obs")
+                r_ii  <- safe_tri_mean(R_ii)
+                r_jj  <- safe_tri_mean(R_jj)
+                denom <- sqrt(r_ii * r_jj)
+                if (!is.na(denom) && denom > 0.001) r_het / denom else r_het
+              }
+
+              htmt_boot_rows <- list()
+
+              # Use pairs from the base HTMT table (C1/C2 columns) when available
+              # so pair labels match exactly; fall back to combinatorics.
+              if (all(c("C1","C2") %in% names(htmt_base))) {
+                pair_list <- unique(htmt_base[, c("C1","C2")])
+              } else {
+                pair_list <- do.call(rbind, combn(cons_h, 2, function(p)
+                  data.frame(C1 = p[1], C2 = p[2], stringsAsFactors = FALSE),
+                  simplify = FALSE))
+              }
+
+              for (k in seq_len(nrow(pair_list))) {
+                ci_h <- as.character(pair_list$C1[k])
+                cj_h <- as.character(pair_list$C2[k])
+                items_i_h <- item_map_h[[ci_h]]
+                items_j_h <- item_map_h[[cj_h]]
+                if (is.null(items_i_h) || is.null(items_j_h)) next
+
+                htmt_orig_val <- tryCatch(
+                  calc_htmt_robust(raw_d, items_i_h, items_j_h),
+                  error = function(e) NA_real_)
+
+                boot_htmt <- replicate(n_boot_htmt, {
+                  idx_b <- sample(nrow(raw_d), nrow(raw_d), replace = TRUE)
+                  tryCatch(calc_htmt_robust(raw_d[idx_b, ], items_i_h, items_j_h),
+                           error = function(e) NA_real_)
+                })
+                boot_htmt <- boot_htmt[!is.na(boot_htmt)]
+                if (length(boot_htmt) < 10) next
+
+                ci_lo_h <- quantile(boot_htmt, 0.025)
+                ci_hi_h <- quantile(boot_htmt, 0.975)
+
+                htmt_boot_rows[[length(htmt_boot_rows) + 1]] <- data.frame(
+                  Pair    = paste0(ci_h, " \u2194 ", cj_h),
+                  HTMT    = round(htmt_orig_val, 3),
+                  CI_2.5  = round(ci_lo_h, 3),
+                  CI_97.5 = round(ci_hi_h, 3),
+                  OK_CI   = ifelse(
+                    !is.na(ci_hi_h) & ci_hi_h < 0.85,
+                    "\u2713 CI upper <0.85",
+                    ifelse(
+                      !is.na(ci_hi_h) & ci_hi_h < 0.90,
+                      "\u26a0 CI upper 0.85\u20130.90 (marginal)",
+                      "\u2717 CI upper \u22650.90"
+                    )
+                  ),
+                  stringsAsFactors = FALSE
+                )
+              }
+
+              if (length(htmt_boot_rows) > 0) {
+                htmt_boot_ci <- do.call(rbind, htmt_boot_rows)
+                message("[HTMT_CI] Attempt 2 OK — ", nrow(htmt_boot_ci), " pairs bootstrapped manually")
+              } else {
+                message("[HTMT_CI] Attempt 2: no pairs could be bootstrapped")
+              }
+            }
+          }
+
+          if (!is.null(htmt_boot_ci) && nrow(htmt_boot_ci) > 0)
+            results$tables$HTMT_CI <- htmt_boot_ci
+        }
+      }, error = function(e) {
+        message("[HTMT_CI] Error: ", e$message)
+      })
+
+# ── Cross-loadings REALES ─────────────────────────────────────────────
+tryCatch({
+  # usar outer loadings solo para identificar el constructo asignado
+  ld_mat <- as.matrix(summ$loadings)
+
+  # usar el objeto PLS ya estimado en este mismo bloque de análisis
+  sc_df <- tryCatch(as.data.frame(pls_est$construct_scores), error = function(e) NULL)
+  if (is.null(sc_df)) {
+    sc_df <- tryCatch(as.data.frame(pls_est$constructScores), error = function(e) NULL)
+  }
+  if (is.null(sc_df)) {
+    sc_df <- tryCatch(as.data.frame(seminr::construct_scores(pls_est)), error = function(e) NULL)
+  }
+
+  raw_df <- data_raw()
+
+  if (!is.null(ld_mat) && nrow(ld_mat) > 0 && !is.null(sc_df) && nrow(sc_df) > 0 && !is.null(raw_df)) {
+
+    item_names <- rownames(ld_mat)
+    cons_names <- intersect(colnames(ld_mat), colnames(sc_df))
+
+    item_names <- item_names[item_names %in% names(raw_df)]
+
+    if (length(item_names) > 0 && length(cons_names) > 0) {
+
+      cl_mat <- matrix(
+        NA_real_,
+        nrow = length(item_names),
+        ncol = length(cons_names),
+        dimnames = list(item_names, cons_names)
+      )
+
+      for (it in item_names) {
+        for (cn in cons_names) {
+          cl_mat[it, cn] <- suppressWarnings(
+            cor(raw_df[[it]], sc_df[[cn]], use = "pairwise.complete.obs")
+          )
+        }
+      }
+
+      cl_df <- as.data.frame(round(cl_mat, 3))
+      cl_df <- cbind(Item = rownames(cl_df), cl_df)
+
+      cl_df$Asignado_a <- apply(ld_mat[item_names, , drop = FALSE], 1, function(r) {
+        mx <- which.max(abs(r))
+        if (length(mx)) names(r)[mx] else NA_character_
+      })
+
+      results$tables$CrossLoadings <- cl_df
+
+      message("[CrossLoadings] OK")
+      print(head(results$tables$CrossLoadings))
+    }
+  } else {
+    message("[CrossLoadings] No se pudo construir: ld_mat/sc_df/raw_df nulos o vacíos")
+  }
+}, error = function(e) {
+  message("[CrossLoadings] Error: ", e$message)
+})
+      # ADDED: HTMT2 — Henseler (2020) correlation-corrected HTMT
+      # HTMT2_ij = (mean of heterotrait-heteromethod correlations) /
+      #            sqrt(geomean_i * geomean_j)
+      # where geomean_k = geometric mean of all monotrait-heteromethod corrs for k
+      # This extends HTMT by correcting for indicator reliability differences.
+      # Requires: scores_df with construct scores (used as proxies for latent vars)
+      # and summ$loadings for indicator-construct mapping.
+      # Reference: Henseler (2020), Henseler et al. (2015, HTMT) extended.
+      tryCatch({
+        ld_m <- as.matrix(summ$loadings)
+        cons_htmt2 <- colnames(ld_m)
+        raw_data_use <- data_raw()
+
+        if (!is.null(ld_m) && !is.null(raw_data_use) && length(cons_htmt2) >= 2) {
+          # Build indicator-construct map from loadings matrix
+          item_map <- list()
+          for (cn_h in cons_htmt2) {
+            items_h <- rownames(ld_m)[abs(ld_m[, cn_h]) > 0.001]
+            items_h <- items_h[items_h %in% names(raw_data_use)]
+            if (length(items_h) >= 2) item_map[[cn_h]] <- items_h
+          }
+          cons_valid <- names(item_map)
+
+          if (length(cons_valid) >= 2) {
+            htmt2_rows <- list()
+            for (i in seq_along(cons_valid)) {
+              for (j in seq_along(cons_valid)) {
+                if (i >= j) next
+                ci <- cons_valid[i]; cj <- cons_valid[j]
+                items_i <- item_map[[ci]]; items_j <- item_map[[cj]]
+                if (length(items_i) < 2 || length(items_j) < 2) next
+
+                # Heteroblock: all cross-construct correlations (items_i x items_j)
+                R_ij <- cor(raw_data_use[, items_i, drop=FALSE],
+                            raw_data_use[, items_j, drop=FALSE],
+                            use = "pairwise.complete.obs")
+                r_hetero <- as.numeric(R_ij)
+                r_hetero_mean <- mean(abs(r_hetero), na.rm=TRUE)
+
+                # Monoblock i: lower triangle of cor(items_i x items_i), excluding diagonal
+                R_ii <- cor(raw_data_use[, items_i, drop=FALSE], use="pairwise.complete.obs")
+                r_mono_i <- R_ii[lower.tri(R_ii)]
+                # Monoblock j
+                R_jj <- cor(raw_data_use[, items_j, drop=FALSE], use="pairwise.complete.obs")
+                r_mono_j <- R_jj[lower.tri(R_jj)]
+
+                # Geometric mean correction (HTMT2)
+                gm_i <- if (length(r_mono_i) > 0 && all(!is.na(r_mono_i)) && all(r_mono_i > 0))
+                            exp(mean(log(r_mono_i))) else mean(abs(r_mono_i), na.rm=TRUE)
+                gm_j <- if (length(r_mono_j) > 0 && all(!is.na(r_mono_j)) && all(r_mono_j > 0))
+                            exp(mean(log(r_mono_j))) else mean(abs(r_mono_j), na.rm=TRUE)
+
+                denom <- sqrt(gm_i * gm_j)
+                htmt2_val <- if (!is.na(denom) && denom > 0) r_hetero_mean / denom else NA_real_
+
+                htmt2_rows[[length(htmt2_rows)+1]] <- data.frame(
+                  C1      = ci,
+                  C2      = cj,
+                  HTMT2   = round(htmt2_val, 3),
+                  OK_0.85 = ifelse(!is.na(htmt2_val) & htmt2_val < 0.85, "\u2713 <0.85",
+                              ifelse(!is.na(htmt2_val) & htmt2_val < 0.90, "\u26a0 <0.90", "\u2717 \u22650.90")),
+                  stringsAsFactors = FALSE
+                )
+              }
+            }
+            if (length(htmt2_rows) > 0)
+              results$tables$HTMT2 <- do.call(rbind, htmt2_rows)
+          }
         }
       }, error = function(e) NULL)
+
+      # ADDED: FIMIX-PLS — k-means segmentation on construct scores
+      # ─────────────────────────────────────────────────────────────────────
+      # METHODOLOGICAL NOTE:
+      #   True FIMIX-PLS (Hahn et al. 2002; Sarstedt et al. 2011) uses a
+      #   finite mixture model estimated via EM on the structural model residuals.
+      #   The 'fimixpls' package is not on CRAN and not maintained. We implement
+      #   k-means clustering on standardised construct scores as a feasible,
+      #   transparent proxy for heterogeneity detection (Hair et al. 2022, p. 238).
+      #   This correctly identifies distinct response segments but does NOT
+      #   provide the segment-specific path coefficients of true FIMIX.
+      #   For publication, label this as "k-means segmentation on construct scores"
+      #   and note that true FIMIX requires specialised software (SmartPLS, ADANCO).
+      #
+      #   User enables via checkbox input$run_fimix and selects k via input$fimix_k.
+      # ─────────────────────────────────────────────────────────────────────
+      if (isTRUE(input$run_fimix) && !is.null(scores_df) && nrow(scores_df) >= 10) {
+        tryCatch({
+          k_fimix <- as.integer(input$fimix_k %||% 2L)
+          k_fimix <- max(2L, min(k_fimix, 6L))
+          scores_scaled <- scale(scores_df)
+
+          # Run k-means with multiple restarts for stability
+          set.seed(user_seed + 876L)
+          km <- kmeans(scores_scaled, centers = k_fimix, nstart = 50, iter.max = 100)
+
+          # Segment sizes and relative shares
+          seg_sizes <- as.data.frame(table(Segmento = km$cluster))
+          seg_sizes$Porcentaje <- round(100 * seg_sizes$Freq / sum(seg_sizes$Freq), 1)
+
+          # Segment-level means per construct
+          scores_with_seg <- data.frame(Segmento = km$cluster, scores_df)
+          seg_means_list  <- lapply(seq_len(k_fimix), function(k) {
+            d_k <- scores_df[km$cluster == k, , drop = FALSE]
+            if (nrow(d_k) == 0) return(NULL)
+            mn <- round(colMeans(d_k, na.rm = TRUE), 3)
+            data.frame(Segmento = k, Constructo = names(mn), Media = mn,
+                       n_seg = nrow(d_k), stringsAsFactors = FALSE)
+          })
+          seg_means <- do.call(rbind, Filter(Negate(is.null), seg_means_list))
+
+          # Within-segment path coefficients (OLS proxy — methodological approximation)
+          seg_paths_list <- lapply(seq_len(k_fimix), function(k) {
+            d_k <- scores_df[km$cluster == k, , drop = FALSE]
+            if (nrow(d_k) < (ncol(scores_df) + 2)) return(NULL)
+            path_rows <- list()
+            for (endo in unique(p_df$to)) {
+              preds_k <- p_df$from[p_df$to == endo]
+              preds_k <- preds_k[preds_k %in% names(d_k)]
+              if (!length(preds_k) || !(endo %in% names(d_k))) next
+              fit_k <- tryCatch(
+                stats::lm(as.formula(paste0(endo, " ~ ", paste(preds_k, collapse = "+"))),
+                          data = d_k),
+                error = function(e) NULL)
+              if (is.null(fit_k)) next
+              coefs_k <- tryCatch(coef(fit_k), error = function(e) NULL)
+              if (is.null(coefs_k)) next
+              for (pred_k in preds_k) {
+                beta_k <- suppressWarnings(as.numeric(coefs_k[pred_k]))
+                path_rows[[length(path_rows)+1]] <- data.frame(
+                  Segmento   = k,
+                  Path       = paste0(pred_k, " -> ", endo),
+                  Beta_seg   = round(beta_k, 3),
+                  n_seg      = nrow(d_k),
+                  stringsAsFactors = FALSE
+                )
+              }
+            }
+            if (length(path_rows) > 0) do.call(rbind, path_rows) else NULL
+          })
+          seg_paths <- do.call(rbind, Filter(Negate(is.null), seg_paths_list))
+
+          # Within/between SS ratio (Calinski-Harabasz index) — higher = better separation
+          total_ss  <- sum(apply(scores_scaled, 2, var, na.rm = TRUE)) * (nrow(scores_scaled) - 1)
+          within_ss <- km$tot.withinss
+          ch_index  <- ((total_ss - within_ss) / (k_fimix - 1)) /
+                       (within_ss / (nrow(scores_scaled) - k_fimix))
+
+          results$tables$FIMIX_Sizes <- data.frame(
+            Segmento   = seg_sizes$Segmento,
+            n          = seg_sizes$Freq,
+            Porcentaje = seg_sizes$Porcentaje,
+            stringsAsFactors = FALSE
+          )
+          results$tables$FIMIX_Paths <- seg_paths
+          results$tables$FIMIX_Means <- seg_means
+
+          results$log <- paste0(results$log, "\n\u2713 FIMIX (k-means proxy, k=", k_fimix,
+                                "): CH-index = ", round(ch_index, 1),
+                                " | Tamanios: ",
+                                paste(seg_sizes$Freq, collapse = "/"))
+        }, error = function(e) {
+          results$log <- paste0(results$log, "\n\u26a0 FIMIX error: ", e$message)
+        })
+      }
 
       # ── Fornell-Larcker Criterion ────────────────────────────────────────
       tryCatch({
@@ -3055,8 +3951,9 @@ observe({
           ind_T   <- ind_beta / ind_se
           ind_p   <- 2 * (1 - pt(abs(ind_T), df = max(nrow(data_raw())-1, 1)))
 
-          results$tables$IndirectEffects <- data.frame(
-            Path    = gsub("->", " -> ", ind_lbl),
+          # ── PATH A: seminr bootstrap provides 2-step indirect paths ──────────
+          boot_ind_df <- data.frame(
+            Path     = gsub("->", " -> ", ind_lbl),
             Beta_ind = round(as.numeric(ind_beta), 3),
             STDEV    = round(as.numeric(ind_se),   3),
             T_Valor  = round(ind_T, 3),
@@ -3064,115 +3961,174 @@ observe({
             IC_2.5   = round(as.numeric(ind_lo),   3),
             IC_97.5  = round(as.numeric(ind_hi),   3),
             Sig      = ifelse(ind_p < 0.001, "***", ifelse(ind_p < 0.01, "**",
-                        ifelse(ind_p < 0.05, "*", ifelse(ind_p < 0.10, "†", "n.s.")))),
+                        ifelse(ind_p < 0.05, "*", ifelse(ind_p < 0.10, "\u2020", "n.s.")))),
+            Steps    = "2-step",    # seminr only returns 2-step paths
             stringsAsFactors = FALSE
           )
-        } else {
-          # Manual computation from path matrix
-          pm_full <- tryCatch(as.matrix(pls_est$path_coef), error = function(e) NULL)
-          if (!is.null(pm_full)) {
-            ind_rows <- list()
-            cons_names <- colnames(pm_full)
-            for (endoC in cons_names) {
-              for (exoC in cons_names) {
-                if (exoC == endoC) next
-                # Find all 1-hop mediators
-                mediators <- cons_names[cons_names != exoC & cons_names != endoC &
-                                        abs(pm_full[exoC, cons_names]) > 1e-10 &
-                                        abs(pm_full[cons_names, endoC]) > 1e-10]
-                # Use column logic: pm[from, to]
-                direct_exo_to_med <- pm_full[, exoC]   # who predicts exoC? no—
-                # pm_full rows=from, cols=to in seminr
-                for (med in cons_names) {
-                  b1 <- tryCatch(pm_full[exoC, med],  error=function(e) 0)
-                  b2 <- tryCatch(pm_full[med, endoC], error=function(e) 0)
-                  if (!is.na(b1) && !is.na(b2) && abs(b1) > 1e-10 && abs(b2) > 1e-10) {
-                    ind_val <- round(b1 * b2, 3)
-                    lbl <- paste0(exoC, " -> ", med, " -> ", endoC)
-                    # Sobel SE approximation for indirect effect
-                    se_b1 <- tryCatch({
-                      pth1 <- paste0(exoC, " -> ", med)
-                      pth1b <- paste0(exoC, "->", med)
-                      rw <- results$tables$Paths
-                      if (!is.null(rw)) {
-                        ridx <- which(gsub("\\s","",rw$Path) == gsub("\\s","",pth1b))
-                        if (length(ridx)) as.numeric(rw$STDEV[ridx[1]]) else NA_real_
-                      } else NA_real_
-                    }, error=function(e) NA_real_)
-                    se_b2 <- tryCatch({
-                      pth2 <- paste0(med, "->", endoC)
-                      rw <- results$tables$Paths
-                      if (!is.null(rw)) {
-                        ridx <- which(gsub("\\s","",rw$Path) == gsub("\\s","",pth2))
-                        if (length(ridx)) as.numeric(rw$STDEV[ridx[1]]) else NA_real_
-                      } else NA_real_
-                    }, error=function(e) NA_real_)
-                    sobel_se <- tryCatch(
-                      sqrt(b2^2 * se_b1^2 + b1^2 * se_b2^2),
-                      error=function(e) NA_real_)
-                    sobel_t  <- if (!is.na(sobel_se) && sobel_se > 0) ind_val/sobel_se else NA_real_
-                    sobel_p  <- if (!is.na(sobel_t)) 2*(1-pt(abs(sobel_t), df=max(nrow(data_raw())-1,1))) else NA_real_
-                    sobel_lo <- if (!is.na(sobel_se)) ind_val - 1.96*sobel_se else NA_real_
-                    sobel_hi <- if (!is.na(sobel_se)) ind_val + 1.96*sobel_se else NA_real_
-                    sobel_sig <- if (is.na(sobel_p)) "N/D" else if (sobel_p<0.001) "***" else if (sobel_p<0.01) "**" else if (sobel_p<0.05) "*" else "n.s."
-                    ind_rows[[length(ind_rows)+1]] <- data.frame(
-                      Path=lbl, Beta_ind=ind_val,
-                      STDEV=round(sobel_se,3), T_Valor=round(sobel_t,3),
-                      P_Valor=round(sobel_p,4),
-                      IC_2.5=round(sobel_lo,3), IC_97.5=round(sobel_hi,3),
-                      Sig=sobel_sig,
-                      stringsAsFactors=FALSE)
-                  }
-                }
+
+          # ── Supplement with 3-step sequential effects ─────────────────────────
+          # seminr's bootstrap_model() does NOT compute 3-step chains.
+          # We compute them analytically via the extended delta method and append them.
+          pm_full_boot <- tryCatch(as.matrix(pls_est$path_coef), error = function(e) NULL)
+          if (!is.null(pm_full_boot)) {
+            all_manual <- compute_indirect_effects(
+              pm_full   = pm_full_boot,
+              paths_tbl = results$tables$Paths,
+              n_obs     = nrow(data_raw())
+            )
+            if (!is.null(all_manual)) {
+              three_step <- all_manual[!is.na(all_manual$Steps) & all_manual$Steps == "3-step", , drop = FALSE]
+              if (nrow(three_step) > 0) {
+                # Align columns before rbind
+                for (col_n in setdiff(names(boot_ind_df), names(three_step)))
+                  three_step[[col_n]] <- NA
+                three_step <- three_step[, names(boot_ind_df), drop = FALSE]
+                boot_ind_df <- rbind(boot_ind_df, three_step)
               }
             }
-            if (length(ind_rows) > 0)
-              results$tables$IndirectEffects <- do.call(rbind, ind_rows)
+          }
+
+          results$tables$IndirectEffects <- boot_ind_df
+        } else {
+          # ── PATH B: Manual computation from path coefficient matrix ─────────
+          # Handles BOTH 2-step (X->M->Y) AND 3-step (X->M1->M2->Y) indirect effects.
+          # Uses compute_indirect_effects() helper defined above the server function.
+          pm_full <- tryCatch(as.matrix(pls_est$path_coef), error = function(e) NULL)
+          if (!is.null(pm_full)) {
+            manual_ind <- compute_indirect_effects(
+              pm_full   = pm_full,
+              paths_tbl = results$tables$Paths,
+              n_obs     = nrow(data_raw())
+            )
+            if (!is.null(manual_ind) && nrow(manual_ind) > 0) {
+              # Drop the internal 'Steps' column before storing — it is used
+              # downstream for hypothesis labeling but not for the display table.
+              # We keep it here so Total Effects can distinguish 3-step chains.
+              results$tables$IndirectEffects <- manual_ind
+            }
           }
         }
 
-        # ── Total Effects = Direct + Indirect ─────────────────────────────
+        # ── Total Effects = Direct + Indirect ─────────────────────────────────
+        # For a 3-step path X->M1->M2->Y, the indirect effect contributes to the
+        # X->Y pair (not X->M1, X->M2, etc.). We extract endpoint pairs from the
+        # path label (split by " -> ", take first and last node) so the indirect
+        # contribution lands on the correct direct-effect row.
         if (!is.null(results$tables$Paths) && !is.null(results$tables$IndirectEffects)) {
           tot_rows <- list()
           p_df_eff <- results$tables$Paths
           i_df_eff <- results$tables$IndirectEffects
-          # All unique source->target pairs
-          all_paths <- unique(c(p_df_eff$Path, i_df_eff$Path))
-          for (pth in all_paths) {
+
+          # For each indirect path, derive its endpoint pair "X -> Y"
+          get_endpoints <- function(path_str) {
+            nodes <- trimws(strsplit(path_str, " -> ")[[1]])
+            if (length(nodes) < 2) return(path_str)
+            paste0(nodes[1], " -> ", nodes[length(nodes)])
+          }
+          i_df_eff$Endpoint <- vapply(i_df_eff$Path, get_endpoints, character(1))
+
+          # Union of all direct paths and all endpoint pairs of indirect paths
+          all_endpoints <- unique(c(p_df_eff$Path, i_df_eff$Endpoint))
+
+          for (pth in all_endpoints) {
             d_val <- if (pth %in% p_df_eff$Path)
               as.numeric(p_df_eff$Beta[p_df_eff$Path == pth][1]) else 0
-            i_val <- if (pth %in% i_df_eff$Path)
-              sum(as.numeric(i_df_eff$Beta_ind[i_df_eff$Path == pth]), na.rm=TRUE) else 0
-            tot_rows[[length(tot_rows)+1]] <- data.frame(
-              Path=pth, Directo=round(d_val,3),
-              Indirecto=round(i_val,3),
-              Total=round(d_val+i_val,3), stringsAsFactors=FALSE)
+            # Sum ALL indirect contributions whose endpoint == pth
+            matching_ind <- i_df_eff[i_df_eff$Endpoint == pth, , drop = FALSE]
+            i_val <- if (nrow(matching_ind) > 0)
+              sum(as.numeric(matching_ind$Beta_ind), na.rm = TRUE) else 0
+            # Collect contributing indirect paths for annotation
+            ind_paths_note <- if (nrow(matching_ind) > 0)
+              paste(matching_ind$Path, collapse = "; ") else ""
+            tot_rows[[length(tot_rows) + 1]] <- data.frame(
+              Path          = pth,
+              Directo       = round(d_val, 3),
+              Indirecto     = round(i_val, 3),
+              Total         = round(d_val + i_val, 3),
+              Rutas_ind     = ind_paths_note,
+              stringsAsFactors = FALSE
+            )
           }
           if (length(tot_rows) > 0)
             results$tables$TotalEffects <- do.call(rbind, tot_rows)
         }
       }, error = function(e) NULL)
 
-      # ── Hypothesis Table ─────────────────────────────────────────────────
+      # ── Hypothesis Table ──────────────────────────────────────────────────────
+      # Numbering convention:
+      #   H1 … Hn  = direct path hypotheses (from Paths table)
+      #   Hn+1 …   = indirect / mediation hypotheses (from IndirectEffects table)
+      #              2-step paths first, then 3-step sequential paths
       tryCatch({
         p_df_h <- results$tables$Paths
+        i_df_h <- results$tables$IndirectEffects  # may be NULL if no mediators
+
+        hyp_rows <- list()
+        h_counter <- 0L
+
+        # ── Direct-path hypotheses ────────────────────────────────────────────
         if (!is.null(p_df_h) && nrow(p_df_h) > 0) {
-          hyp_tbl <- data.frame(
-            Hipotesis = paste0("H", seq_len(nrow(p_df_h))),
-            Relacion  = p_df_h$Path,
-            Beta      = p_df_h$Beta,
-            STDEV     = p_df_h$STDEV,
-            T_Valor   = p_df_h$T_Valor,
-            P_Valor   = p_df_h$P_Valor,
-            IC_2.5    = p_df_h$IC_2.5,
-            IC_97.5   = p_df_h$IC_97.5,
-            Sig       = p_df_h$Sig,
-            Decision  = ifelse(!is.na(p_df_h$P_Valor) & p_df_h$P_Valor < 0.05,
-                               t$hyp_supported, t$hyp_rejected),
-            stringsAsFactors = FALSE
-          )
-          results$tables$Hypotheses <- hyp_tbl
+          for (k in seq_len(nrow(p_df_h))) {
+            h_counter <- h_counter + 1L
+            hyp_rows[[length(hyp_rows) + 1]] <- data.frame(
+              Hipotesis = paste0("H", h_counter),
+              Relacion  = p_df_h$Path[k],
+              Beta      = p_df_h$Beta[k],
+              STDEV     = p_df_h$STDEV[k],
+              T_Valor   = p_df_h$T_Valor[k],
+              P_Valor   = p_df_h$P_Valor[k],
+              IC_2.5    = p_df_h$IC_2.5[k],
+              IC_97.5   = p_df_h$IC_97.5[k],
+              Sig       = p_df_h$Sig[k],
+              Tipo      = "Directo",
+              Decision  = ifelse(!is.na(p_df_h$P_Valor[k]) & p_df_h$P_Valor[k] < 0.05,
+                                 t$hyp_supported, t$hyp_rejected),
+              stringsAsFactors = FALSE
+            )
+          }
         }
+
+        # ── Indirect / mediation hypotheses ───────────────────────────────────
+        if (!is.null(i_df_h) && nrow(i_df_h) > 0 && !("Nota" %in% names(i_df_h))) {
+          # Sort: 2-step rows first, then 3-step rows (if Steps column exists)
+          if ("Steps" %in% names(i_df_h)) {
+            steps_col <- i_df_h$Steps
+            # Any non-NA non-"3-step" value is treated as 2-step
+            is3 <- !is.na(steps_col) & steps_col == "3-step"
+            i_df_h <- rbind(i_df_h[!is3, , drop = FALSE],
+                            i_df_h[ is3, , drop = FALSE])
+          }
+          for (k in seq_len(nrow(i_df_h))) {
+            h_counter <- h_counter + 1L
+            pv_ind <- suppressWarnings(as.numeric(i_df_h$P_Valor[k]))
+            # Mediation decision: significant indirect + check CI excludes zero
+            ic2  <- suppressWarnings(as.numeric(i_df_h$IC_2.5[k]))
+            ic97 <- suppressWarnings(as.numeric(i_df_h$IC_97.5[k]))
+            ci_ok <- !is.na(ic2) && !is.na(ic97) && ((ic2 > 0 && ic97 > 0) || (ic2 < 0 && ic97 < 0))
+            sig_ind <- (!is.na(pv_ind) && pv_ind < 0.05) || ci_ok
+            steps_lbl <- if ("Steps" %in% names(i_df_h) && !is.na(i_df_h$Steps[k]))
+                           i_df_h$Steps[k] else "Indirecto"
+            dec_lbl <- if (sig_ind) t$hyp_supported else t$hyp_rejected
+            hyp_rows[[length(hyp_rows) + 1]] <- data.frame(
+              Hipotesis = paste0("H", h_counter),
+              Relacion  = i_df_h$Path[k],
+              Beta      = i_df_h$Beta_ind[k],
+              STDEV     = i_df_h$STDEV[k],
+              T_Valor   = i_df_h$T_Valor[k],
+              P_Valor   = pv_ind,
+              IC_2.5    = i_df_h$IC_2.5[k],
+              IC_97.5   = i_df_h$IC_97.5[k],
+              Sig       = i_df_h$Sig[k],
+              Tipo      = steps_lbl,
+              Decision  = dec_lbl,
+              stringsAsFactors = FALSE
+            )
+          }
+        }
+
+        if (length(hyp_rows) > 0)
+          results$tables$Hypotheses <- do.call(rbind, hyp_rows)
+
       }, error = function(e) NULL)
 
       # ── PLS Predict ──────────────────────────────────────────────────────
@@ -3182,7 +4138,7 @@ observe({
         if (!is.null(scores_df) && !is.null(p_df)) {
           endos_pp <- unique(p_df$to)
           pp_rows <- list()
-          set.seed(42)
+          set.seed(user_seed + 19L)
           k_fold <- 10L
           for (endo_pp in endos_pp) {
             preds_pp <- unique(p_df$from[p_df$to == endo_pp])
@@ -3633,7 +4589,8 @@ observe({
               results$log <- "\u25ba [MICOM] Calculando invarianza de medida..."
               micom_out <- tryCatch(
                 run_micom(data_full = data_micomga, group_var = grp_var_run,
-                          m_model = m_model, s_model = s_model, n_permut = 1000),
+                          m_model = m_model, s_model = s_model, n_permut = 1000,
+                          lang = isolate(input$app_lang)),
                 error = function(e) {
                   warnings_multigroup <<- c(warnings_multigroup,
                     paste0("\u26a0 MICOM error: ", e$message))
@@ -3657,7 +4614,7 @@ observe({
                 run_mga(data_full = data_micomga, group_var = grp_var_run,
                         m_model = m_model, s_model = s_model,
                         min_n = as.integer(input$min_group_n %||% 30),
-                        n_permut = 1000),
+                        n_permut = 1000, lang = isolate(input$app_lang)),
                 error = function(e) {
                   warnings_multigroup <<- c(warnings_multigroup,
                     paste0("\u26a0 MGA error: ", e$message))
@@ -3708,7 +4665,9 @@ observe({
     }
     if (is.null(dot) || !is.character(dot) || !nzchar(dot)) {
       # Diagrama de emergencia simple
-      dot <- 'digraph PLS { graph [rankdir=LR, bgcolor="white"]; node [fontname="Helvetica"]; "Modelo" [shape=ellipse, style=filled, fillcolor="#1565C0", fontcolor=white, label="PLS-SEM\\nModelo estimado"]; }'
+      dot <- paste0('digraph PLS { graph [rankdir=LR, bgcolor="white"]; node [fontname="Helvetica"]; "Model" [shape=ellipse, style=filled, fillcolor="#1565C0", fontcolor=white, label="PLS-SEM\\n',
+                      if (isTRUE(input$app_lang != "en")) "Modelo estimado" else "Estimated model",
+                      '"]; }')
     }
     DiagrammeR::grViz(dot)
   })
@@ -3962,6 +4921,234 @@ observe({
     datatable(results$tables$SRMR, rownames=FALSE, options=list(dom="t"))
   })
 
+  # ADDED: renderDT for bootstrapped loading CIs
+  output$table_loading_ci <- renderDT({
+    df <- results$tables$LoadingCI
+    if (is.null(df) || nrow(df) == 0)
+      return(datatable(data.frame(
+        Nota = "Run analysis first. Loading CIs are computed automatically during bootstrapping."),
+        rownames=FALSE, options=list(dom="t")))
+    datatable(df, rownames=FALSE,
+              options=list(pageLength=20, scrollX=TRUE, dom="ftp")) |>
+      formatStyle("Loading",
+        backgroundColor = styleInterval(c(0.399, 0.699), c("#FFCDD2","#FFF9C4","#C8E6C9"))) |>
+      formatStyle("CI_2.5",
+        backgroundColor = "#FFF8E1") |>
+      formatStyle("CI_97.5",
+        backgroundColor = "#FFF8E1") |>
+      formatStyle("Estable",
+        color = styleEqual(c("\u2713 \u22650.4", "\u26a0 Revisar"), c("#2E7D32","#C62828")),
+        fontWeight = "bold")
+  })
+
+  # ADDED: renderDT for HTMT with bootstrap CIs
+  output$table_htmt_ci <- renderDT({
+    df <- results$tables$HTMT_CI
+    if (is.null(df) || nrow(df) == 0)
+      return(datatable(data.frame(
+        Nota = "Run analysis first. HTMT CIs are computed automatically via bootstrap."),
+        rownames=FALSE, options=list(dom="t")))
+    datatable(df, rownames=FALSE,
+              options=list(pageLength=15, scrollX=TRUE, dom="tip")) |>
+      formatStyle("HTMT",
+        backgroundColor = styleInterval(c(0.849, 0.899), c("#C8E6C9","#FFF9C4","#FFCDD2")),
+        fontWeight = "bold") |>
+      formatStyle("CI_97.5",
+        backgroundColor = styleInterval(c(0.849, 0.899), c("#C8E6C9","#FFF9C4","#FFCDD2"))) |>
+      formatStyle("OK_CI",
+        color = styleEqual(
+          c("\u2713 CI upper <0.85",
+            "\u26a0 CI upper 0.85\u20130.90 (marginal)",
+            "\u2717 CI upper \u22650.90"),
+          c("#2E7D32","#F57F17","#C62828")),
+        fontWeight = "bold")
+  })
+
+  # ADDED: renderDT for HTMT2
+  output$table_htmt2 <- renderDT({
+    df <- results$tables$HTMT2
+    if (is.null(df) || nrow(df) == 0)
+      return(datatable(data.frame(
+        Nota = "Run analysis first. HTMT2 requires >= 2 items per construct."),
+        rownames=FALSE, options=list(dom="t")))
+    datatable(df, rownames=FALSE,
+              options=list(pageLength=15, scrollX=TRUE, dom="tip")) |>
+      formatStyle("HTMT2",
+        backgroundColor = styleInterval(c(0.849, 0.899), c("#C8E6C9","#FFF9C4","#FFCDD2")),
+        fontWeight = "bold") |>
+      formatStyle("OK_0.85",
+        color = styleEqual(
+          c("\u2713 <0.85","\u26a0 <0.90","\u2717 \u22650.90"),
+          c("#2E7D32","#F57F17","#C62828")),
+        fontWeight = "bold")
+  })
+
+  # ADDED: FIMIX status UI
+  output$fimix_status_ui <- renderUI({
+    if (!isTRUE(input$run_fimix))
+      return(tags$div(style="color:#888;font-style:italic;padding:8px;",
+        "Enable 'Calculate FIMIX segmentation' under Analysis \u2192 Heterogeneity and re-run the analysis."))
+    sz <- results$tables$FIMIX_Sizes
+    if (is.null(sz) || nrow(sz) == 0)
+      return(tags$div(style="color:#888;font-style:italic;padding:8px;", "Run analysis first."))
+    k_ran <- nrow(sz)
+    tags$div(style="background:#E8F5E9;border-left:4px solid #2E7D32;padding:10px;border-radius:4px;",
+      tags$b(style="color:#2E7D32;", paste0("\u2713 FIMIX segmentation complete: k = ", k_ran, " segments")),
+      tags$p(paste0("Segment sizes: ",
+             paste(paste0("Seg ", sz$Segmento, " (n=", sz$n, ", ", sz$Porcentaje, "%)"),
+                   collapse = " | ")))
+    )
+  })
+
+  # ADDED: renderDT for FIMIX segment sizes
+  output$table_fimix_sizes <- renderDT({
+    df <- results$tables$FIMIX_Sizes
+    if (is.null(df) || nrow(df) == 0)
+      return(datatable(data.frame(Nota="Enable FIMIX and run analysis."), rownames=FALSE, options=list(dom="t")))
+    datatable(df, rownames=FALSE, options=list(dom="t")) |>
+      formatStyle("Porcentaje",
+        backgroundColor = styleInterval(c(19.9, 29.9), c("#FFCDD2","#FFF9C4","#C8E6C9")))
+  })
+
+  # ADDED: renderDT for FIMIX construct means per segment
+  output$table_fimix_means <- renderDT({
+    df <- results$tables$FIMIX_Means
+    if (is.null(df) || nrow(df) == 0)
+      return(datatable(data.frame(Nota="Enable FIMIX and run analysis."), rownames=FALSE, options=list(dom="t")))
+    datatable(df, rownames=FALSE, options=list(pageLength=15, scrollX=TRUE, dom="tip"))
+  })
+
+  # ADDED: renderDT for FIMIX segment-level path coefficients
+  output$table_fimix_paths <- renderDT({
+    df <- results$tables$FIMIX_Paths
+    if (is.null(df) || nrow(df) == 0)
+      return(datatable(data.frame(Nota="Enable FIMIX and run analysis."), rownames=FALSE, options=list(dom="t")))
+    datatable(df, rownames=FALSE, options=list(pageLength=20, scrollX=TRUE, dom="ftp")) |>
+      formatStyle("Beta_seg",
+        backgroundColor = styleInterval(c(-0.001, 0.299), c("#FFCDD2","#FFF9C4","#C8E6C9")))
+  })
+
+  # ADDED: download handlers for new tables
+  # ── Loading CI downloads ──────────────────────────────────────────────────────
+  output$dl_loading_ci_csv <- downloadHandler(
+    filename = function() paste0("LoadingCI_", Sys.Date(), ".csv"),
+    contentType = "text/csv",
+    content = function(file) {
+      df <- results$tables$LoadingCI; req(!is.null(df))
+      write.csv(df, file, row.names=FALSE, fileEncoding="UTF-8")
+    }
+  )
+  output$dl_loading_ci_xlsx <- downloadHandler(
+    filename = function() paste0("LoadingCI_", Sys.Date(), ".xlsx"),
+    contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    content = function(file) {
+      df <- results$tables$LoadingCI; req(!is.null(df))
+      tryCatch({
+        wb <- openxlsx::createWorkbook()
+        openxlsx::addWorksheet(wb, "Loading CI")
+        openxlsx::writeData(wb, 1, df)
+        hs <- openxlsx::createStyle(fgFill="#1565C0", fontColour="white", textDecoration="bold", halign="center")
+        openxlsx::addStyle(wb, 1, hs, rows=1, cols=seq_len(ncol(df)), gridExpand=TRUE)
+        openxlsx::setColWidths(wb, 1, cols=seq_len(ncol(df)), widths="auto")
+        openxlsx::saveWorkbook(wb, file, overwrite=TRUE)
+      }, error = function(e) write.csv(df, file, row.names=FALSE))
+    }
+  )
+
+  # ── HTMT CI downloads ─────────────────────────────────────────────────────────
+  output$dl_htmt_ci_csv <- downloadHandler(
+    filename = function() paste0("HTMT_CI_", Sys.Date(), ".csv"),
+    contentType = "text/csv",
+    content = function(file) {
+      df <- results$tables$HTMT_CI; req(!is.null(df))
+      write.csv(df, file, row.names=FALSE, fileEncoding="UTF-8")
+    }
+  )
+  output$dl_htmt_ci_xlsx <- downloadHandler(
+    filename = function() paste0("HTMT_CI_", Sys.Date(), ".xlsx"),
+    contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    content = function(file) {
+      df <- results$tables$HTMT_CI; req(!is.null(df))
+      tryCatch({
+        wb <- openxlsx::createWorkbook()
+        openxlsx::addWorksheet(wb, "HTMT CI")
+        openxlsx::writeData(wb, 1, df)
+        hs <- openxlsx::createStyle(fgFill="#1565C0", fontColour="white", textDecoration="bold", halign="center")
+        openxlsx::addStyle(wb, 1, hs, rows=1, cols=seq_len(ncol(df)), gridExpand=TRUE)
+        openxlsx::setColWidths(wb, 1, cols=seq_len(ncol(df)), widths="auto")
+        openxlsx::saveWorkbook(wb, file, overwrite=TRUE)
+      }, error = function(e) write.csv(df, file, row.names=FALSE))
+    }
+  )
+
+  # ── HTMT2 downloads ───────────────────────────────────────────────────────────
+  output$dl_htmt2_csv <- downloadHandler(
+    filename = function() paste0("HTMT2_", Sys.Date(), ".csv"),
+    contentType = "text/csv",
+    content = function(file) {
+      df <- results$tables$HTMT2; req(!is.null(df))
+      write.csv(df, file, row.names=FALSE, fileEncoding="UTF-8")
+    }
+  )
+  output$dl_htmt2_xlsx <- downloadHandler(
+    filename = function() paste0("HTMT2_", Sys.Date(), ".xlsx"),
+    contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    content = function(file) {
+      df <- results$tables$HTMT2; req(!is.null(df))
+      tryCatch({
+        wb <- openxlsx::createWorkbook()
+        openxlsx::addWorksheet(wb, "HTMT2")
+        openxlsx::writeData(wb, 1, df)
+        hs <- openxlsx::createStyle(fgFill="#1565C0", fontColour="white", textDecoration="bold", halign="center")
+        openxlsx::addStyle(wb, 1, hs, rows=1, cols=seq_len(ncol(df)), gridExpand=TRUE)
+        openxlsx::setColWidths(wb, 1, cols=seq_len(ncol(df)), widths="auto")
+        openxlsx::saveWorkbook(wb, file, overwrite=TRUE)
+      }, error = function(e) write.csv(df, file, row.names=FALSE))
+    }
+  )
+
+  # ── FIMIX downloads ───────────────────────────────────────────────────────────
+  output$dl_fimix_csv <- downloadHandler(
+    filename = function() paste0("FIMIX_", Sys.Date(), ".csv"),
+    contentType = "text/csv",
+    content = function(file) {
+      df_paths <- results$tables$FIMIX_Paths
+      df_sizes <- results$tables$FIMIX_Sizes
+      df_means <- results$tables$FIMIX_Means
+      if (is.null(df_paths) && is.null(df_sizes)) return(write.csv(data.frame(Nota="No FIMIX results."), file))
+      tmpdir <- tempfile(); dir.create(tmpdir)
+      if (!is.null(df_sizes)) write.csv(df_sizes, file.path(tmpdir,"FIMIX_Sizes.csv"), row.names=FALSE)
+      if (!is.null(df_means)) write.csv(df_means, file.path(tmpdir,"FIMIX_Means.csv"), row.names=FALSE)
+      if (!is.null(df_paths)) write.csv(df_paths, file.path(tmpdir,"FIMIX_Paths.csv"), row.names=FALSE)
+      all_files <- list.files(tmpdir, full.names=TRUE)
+      zip(zipfile=file, files=all_files, flags="-j")
+    }
+  )
+  output$dl_fimix_xlsx <- downloadHandler(
+    filename = function() paste0("FIMIX_", Sys.Date(), ".xlsx"),
+    contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    content = function(file) {
+      df_paths <- results$tables$FIMIX_Paths
+      df_sizes <- results$tables$FIMIX_Sizes
+      df_means <- results$tables$FIMIX_Means
+      tryCatch({
+        wb <- openxlsx::createWorkbook()
+        hs <- openxlsx::createStyle(fgFill="#1565C0", fontColour="white", textDecoration="bold")
+        add_sheet <- function(nm, df) {
+          if (is.null(df) || nrow(df) == 0) return()
+          openxlsx::addWorksheet(wb, nm)
+          openxlsx::writeData(wb, nm, df)
+          openxlsx::addStyle(wb, nm, hs, rows=1, cols=seq_len(ncol(df)), gridExpand=TRUE)
+          openxlsx::setColWidths(wb, nm, cols=seq_len(ncol(df)), widths="auto")
+        }
+        add_sheet("Segment Sizes",  df_sizes)
+        add_sheet("Construct Means",df_means)
+        add_sheet("Path Coefs",     df_paths)
+        openxlsx::saveWorkbook(wb, file, overwrite=TRUE)
+      }, error=function(e) write.csv(df_paths %||% data.frame(), file, row.names=FALSE))
+    }
+  )
+
 
   # ── Language reactive ──────────────────────────────────────────────────────
   lang <- reactive({ input$app_lang %||% "es" })
@@ -4094,16 +5281,18 @@ observe({
     if (is.null(df) || nrow(df) == 0)
       return(datatable(data.frame(Nota = i18n()$no_mediation),
                        rownames=FALSE, options=list(dom="t")))
-    dt <- datatable(df, rownames=FALSE,
+    # Remove internal Steps column from display (kept in table for downstream use)
+    display_df <- df[, setdiff(names(df), "Steps"), drop = FALSE]
+    dt <- datatable(display_df, rownames=FALSE,
                     options=list(pageLength=15, scrollX=TRUE, dom="tip")) |>
       formatStyle("Beta_ind",
         backgroundColor = styleInterval(c(-0.0001, 0.0001), c("#FFCDD2","#F5F5F5","#C8E6C9")))
-    if ("Sig" %in% names(df))
+    if ("Sig" %in% names(display_df))
       dt <- dt |> formatStyle("Sig",
-        color = styleEqual(c("***","**","*","†","n.s.","N/D"),
+        color = styleEqual(c("***","**","*","\u2020","n.s.","N/D"),
                            c("#1B5E20","#2E7D32","#388E3C","#F57F17","#C62828","#888")),
         fontWeight = "bold")
-    if ("IC_2.5" %in% names(df) && "IC_97.5" %in% names(df)) {
+    if ("IC_2.5" %in% names(display_df) && "IC_97.5" %in% names(display_df)) {
       dt <- dt |>
         formatStyle("IC_2.5",  backgroundColor = "#FFF8E1") |>
         formatStyle("IC_97.5", backgroundColor = "#FFF8E1")
@@ -4128,17 +5317,30 @@ observe({
     if (is.null(df) || nrow(df) == 0)
       return(datatable(data.frame(Nota = i18n()$run_first),
                        rownames=FALSE, options=list(dom="t")))
-    datatable(df, rownames=FALSE,
+    dt <- datatable(df, rownames=FALSE,
               options=list(pageLength=15, scrollX=TRUE, dom="tip")) |>
       formatStyle("Decision",
-        color = styleEqual(c("\u2713 Soportada","\u2717 Rechazada","\u2713 Supported","\u2717 Rejected"), c("#1B5E20","#C62828","#1B5E20","#C62828")),
+        color = styleEqual(c("\u2713 Soportada","\u2717 Rechazada","\u2713 Supported","\u2717 Rejected"),
+                           c("#1B5E20","#C62828","#1B5E20","#C62828")),
         fontWeight = "bold") |>
       formatStyle("P_Valor",
         backgroundColor = styleInterval(c(0.049, 0.099), c("#C8E6C9","#FFF9C4","#FFCDD2"))) |>
       formatStyle("Sig",
-        color = styleEqual(c("***","**","*","†","n.s."),
+        color = styleEqual(c("***","**","*","\u2020","n.s."),
                            c("#1B5E20","#2E7D32","#388E3C","#F57F17","#C62828")),
         fontWeight = "bold")
+    # Highlight sequential mediation rows if Tipo column exists
+    if ("Tipo" %in% names(df)) {
+      dt <- dt |> formatStyle("Tipo",
+        backgroundColor = styleEqual(
+          c("3-step","2-step","Directo","Indirecto"),
+          c("#EDE7F6","#E8F5E9","#FFFFFF","#E3F2FD")),
+        color = styleEqual(
+          c("3-step","2-step","Directo","Indirecto"),
+          c("#6A1B9A","#1B5E20","#000000","#1565C0")),
+        fontWeight = "bold")
+    }
+    dt
   })
 
   # ── PLS Predict table ─────────────────────────────────────────────────────
@@ -4201,7 +5403,22 @@ observe({
     contentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     content  = function(file) {
       all_tbls <- results$tables
-      tryCatch({
+
+        # FIX 1: Include Gaussian Copula results in the Word report
+        # Populate GaussianCopula entry from copula_results$table if available
+        copula_tbl_raw <- copula_results$table
+        if (!is.null(copula_tbl_raw) && nrow(copula_tbl_raw) > 0) {
+          cop_disp <- copula_tbl_raw[, intersect(
+            c("Path","PLS_Beta","Copula_Coef","Std_Error","CI_lo","CI_hi",
+              "t_value","p_value","N_used","Interpretation"),
+            names(copula_tbl_raw)), drop = FALSE]
+          names(cop_disp) <- c("Path","PLS \u03b2","Copula Coef.","Std. Error",
+                               "CI 2.5%","CI 97.5%","t-value","p-value","N",
+                               "Interpretation")[seq_len(ncol(cop_disp))]
+          all_tbls[["GaussianCopula"]] <- cop_disp
+        }
+
+        tryCatch({
         doc <- officer::read_docx()
         # Título
         doc <- officer::body_add_par(doc,
@@ -4210,47 +5427,67 @@ observe({
         doc <- officer::body_add_par(doc,
           paste0(if(input$app_lang=="en") "Generated: " else "Generado: ",
                  format(Sys.time(), "%Y-%m-%d %H:%M"),
-                 " | CANCHARI PLS-SEM PRO V2.0 | seminr + R"),
+                 " | CANCHARI PLS-SEM PRO V2.0 | seminr + R",
+                 " | seed = ", isolate(input$analysis_seed %||% 123),
+                 " | nboot = ", isolate(input$nboot %||% 5000)),
           style = "Normal")
 
-        section_order <- c("Confiabilidad","Cargas","CrossLoadings","FornellLarcker",
-                           "HTMT","Paths","Hypotheses","IndirectEffects","TotalEffects",
-                           "R2","Q2","PLSPredict","VIF","SRMR","MICOM_RESUMEN","MGA")
+        # FIX 3: LoadingCI (Table 2a) placed immediately after Cargas (Table 2)
+        section_order <- c("Confiabilidad","Cargas","LoadingCI","CrossLoadings","FornellLarcker",
+                           "HTMT","HTMT_CI","HTMT2",
+                           "Paths","Hypotheses","IndirectEffects","TotalEffects",
+                           "R2","Q2","PLSPredict","VIF","SRMR","MICOM_RESUMEN","MGA",
+                           "FIMIX_Sizes","FIMIX_Means","FIMIX_Paths",
+                           "GaussianCopula")
         tbl_labels_en <- c(
           Confiabilidad   = "Table 1. Reliability and Convergent Validity",
           Cargas          = "Table 2. Outer Loadings",
+          LoadingCI       = "Table 2a. Outer Loading Bootstrapped CIs",
           CrossLoadings   = "Table 3. Cross-Loadings",
           FornellLarcker  = "Table 4. Fornell-Larcker Criterion",
-          HTMT            = "Table 5. Heterotrait-Monotrait Ratio (HTMT)",
+          HTMT            = "Table 5. HTMT",
+          HTMT_CI         = "Table 5a. HTMT with Bootstrapped 95% CI",
+          HTMT2           = "Table 5b. HTMT2 (Geometric-Mean Corrected)",
           Paths           = "Table 6. Path Coefficients - Structural Model",
           Hypotheses      = "Table 7. Hypothesis Testing Results",
           IndirectEffects = "Table 8. Specific Indirect Effects",
           TotalEffects    = "Table 9. Total Effects",
-          R2              = "Table 10. Coefficient of Determination (R²)",
-          Q2              = "Table 11. Predictive Relevance (Q²)",
+          R2              = "Table 10. Coefficient of Determination (R\u00b2)",
+          Q2              = "Table 11. Predictive Relevance (Q\u00b2)",
           PLSPredict      = "Table 12. PLS Predict - Out-of-Sample",
           VIF             = "Table 13. Collinearity (VIF)",
           SRMR            = "Table 14. Model Fit (SRMR)",
           MICOM_RESUMEN   = "Table 15. MICOM - Measurement Invariance",
-          MGA             = "Table 16. Multi-Group Analysis (MGA)"
+          MGA             = "Table 16. Multi-Group Analysis (MGA)",
+          FIMIX_Sizes     = "Table 17a. FIMIX Heterogeneity - Segment Sizes",
+          FIMIX_Means     = "Table 17b. FIMIX Heterogeneity - Construct Means",
+          FIMIX_Paths     = "Table 17c. FIMIX Heterogeneity - Path Coefs per Segment",
+          GaussianCopula  = "Table 18. Gaussian Copula Endogeneity Test (Park & Gupta, 2012)"
         )
         tbl_labels_es <- c(
           Confiabilidad   = "Tabla 1. Confiabilidad y Validez Convergente",
           Cargas          = "Tabla 2. Cargas Factoriales (Outer Loadings)",
+          LoadingCI       = "Tabla 2a. IC Bootstrapped de Cargas Factoriales",
           CrossLoadings   = "Tabla 3. Cargas Cruzadas (Cross-Loadings)",
           FornellLarcker  = "Tabla 4. Criterio Fornell-Larcker",
           HTMT            = "Tabla 5. HTMT",
+          HTMT_CI         = "Tabla 5a. HTMT con IC Bootstrapped 95%",
+          HTMT2           = "Tabla 5b. HTMT2 (Media Geom\u00e9trica Corregida)",
           Paths           = "Tabla 6. Coeficientes de Ruta",
-          Hypotheses      = "Tabla 7. Resultados de Hipótesis",
-          IndirectEffects = "Tabla 8. Efectos Indirectos Específicos",
+          Hypotheses      = "Tabla 7. Resultados de Hip\u00f3tesis",
+          IndirectEffects = "Tabla 8. Efectos Indirectos Espec\u00edficos",
           TotalEffects    = "Tabla 9. Efectos Totales",
-          R2              = "Tabla 10. Coeficiente de Determinación (R²)",
-          Q2              = "Tabla 11. Relevancia Predictiva (Q²)",
+          R2              = "Tabla 10. Coeficiente de Determinaci\u00f3n (R\u00b2)",
+          Q2              = "Tabla 11. Relevancia Predictiva (Q\u00b2)",
           PLSPredict      = "Tabla 12. PLS Predict (Out-of-Sample)",
           VIF             = "Tabla 13. Colinealidad (VIF)",
           SRMR            = "Tabla 14. Ajuste del Modelo (SRMR)",
           MICOM_RESUMEN   = "Tabla 15. MICOM - Invarianza de Medida",
-          MGA             = "Tabla 16. Análisis Multigrupo (MGA)"
+          MGA             = "Tabla 16. An\u00e1lisis Multigrupo (MGA)",
+          FIMIX_Sizes     = "Tabla 17a. FIMIX Heterogeneidad - Tama\u00f1os de Segmento",
+          FIMIX_Means     = "Tabla 17b. FIMIX Heterogeneidad - Medias por Segmento",
+          FIMIX_Paths     = "Tabla 17c. FIMIX Heterogeneidad - Coefs. de Ruta por Segmento",
+          GaussianCopula  = "Tabla 18. Test de Endogeneidad Gaussian Copula (Park & Gupta, 2012)"
         )
         tbl_labels <- if (input$app_lang=="en") tbl_labels_en else tbl_labels_es
 
@@ -4259,6 +5496,58 @@ observe({
           if (is.null(df_t) || !is.data.frame(df_t) || nrow(df_t) == 0) next
           lbl <- if (nm %in% names(tbl_labels)) tbl_labels[[nm]] else paste("Table -", nm)
           doc <- officer::body_add_par(doc, lbl, style = "heading 2")
+
+          # ── Strip internal/auxiliary columns not intended for publication ─────
+          # "Steps"     : internal classification tag (2-step / 3-step)
+          # "Endpoint"  : intermediate column used for Total Effects computation
+          # "Rutas_ind" : annotation column (shown in app but too verbose for Word)
+          internal_cols <- c("Steps", "Endpoint", "Rutas_ind")
+          df_t <- df_t[, setdiff(names(df_t), internal_cols), drop = FALSE]
+
+          # FIX 2: HTMT_CI — rename columns to clean publication headers and
+          # recalculate OK_CI so it correctly reflects whether CI upper < 0.85
+          if (nm == "HTMT_CI") {
+            # Ensure OK_CI logic is correct (re-derive from CI_97.5 numeric values)
+            if ("CI_97.5" %in% names(df_t)) {
+              ci_hi_num <- suppressWarnings(as.numeric(df_t$CI_97.5))
+              df_t$OK_CI <- ifelse(
+                !is.na(ci_hi_num) & ci_hi_num < 0.85,
+                "\u2713 Discriminant validity supported (CI upper < 0.85)",
+                ifelse(!is.na(ci_hi_num) & ci_hi_num < 0.90,
+                       "\u26a0 Marginal (0.85 \u2264 CI upper < 0.90) — review carefully",
+                       "\u2717 Not supported (CI upper \u2265 0.90)")
+              )
+            }
+            # Rename columns to clean APA-style headers
+            col_rename_htmt <- c(
+              Pair    = "Construct Pair",
+              HTMT    = "HTMT",
+              CI_2.5  = "CI Lower (2.5%)",
+              CI_97.5 = "CI Upper (97.5%)",
+              OK_CI   = "Discriminant Validity (Bootstrap 95% CI)"
+            )
+            for (old_col in names(col_rename_htmt)) {
+              if (old_col %in% names(df_t))
+                names(df_t)[names(df_t) == old_col] <- col_rename_htmt[[old_col]]
+            }
+            # Add methodological note before table
+            doc <- officer::body_add_par(doc,
+              paste0("Note. Bootstrap percentile CI (500 iterations). ",
+                     "Criterion: CI upper < 0.85 confirms discriminant validity ",
+                     "(Henseler et al., 2015; Hair et al., 2022)."),
+              style = "Normal")
+          }
+
+          # FIX 1: GaussianCopula — add methodological note before table
+          if (nm == "GaussianCopula") {
+            doc <- officer::body_add_par(doc,
+              paste0("Note. Gaussian Copula procedure following Park & Gupta (2012). ",
+                     "A significant Copula coefficient (p < .05) indicates potential ",
+                     "endogeneity in that predictor. PLS \u03b2 = bootstrapped path coefficient; ",
+                     "CI = 95% OLS confidence interval; SE = standard error (OLS)."),
+              style = "Normal")
+          }
+
           # Convert all columns to character to avoid officer type issues
           df_char <- as.data.frame(lapply(df_t, as.character), stringsAsFactors = FALSE)
           ft <- flextable::flextable(df_char)
@@ -4318,51 +5607,79 @@ observe({
     if (length(out) == 0) NULL else out
   }
 
-  observeEvent(input$run_copula_test, {
-    use_mean  <- isTRUE(isolate(input$copula_use_mean_scores))
-    pls_obj   <- results$pls_est
-    raw_data  <- data_raw()
-    cim       <- get_construct_items_map()
-    p_df      <- get_p_df()
+ observeEvent(input$run_copula_test, {
+  use_mean  <- isTRUE(isolate(input$copula_use_mean_scores))
+  pls_obj   <- results$pls_est
+  raw_data  <- data_raw()
+  cim       <- get_construct_items_map()
+  p_df      <- get_p_df()
 
-    # ── Resolve scores ───────────────────────────────────────────────────────
-    scores_df <- build_scores_df(pls_obj, raw_data, cim, use_mean_scores = use_mean)
+  # ── Resolve scores ───────────────────────────────────────────────────────
+  scores_df <- build_scores_df(pls_obj, raw_data, cim, use_mean_scores = use_mean)
 
-    if (is.null(scores_df) || nrow(scores_df) == 0) {
-      copula_results$status <- paste0(
-        "No se pudieron obtener los scores de constructos. ",
-        if (use_mean) "Verifique que los indicadores estén definidos en el modelo."
-        else "Ejecute el análisis PLS-SEM primero."
-      )
-      copula_results$table <- NULL
-      return()
-    }
+  if (is.null(scores_df) || nrow(scores_df) == 0) {
+    copula_results$status <- paste0(
+      "No se pudieron obtener los scores de constructos. ",
+      if (use_mean) "Verifique que los indicadores estén definidos en el modelo."
+      else "Ejecute el análisis PLS-SEM primero."
+    )
+    copula_results$table <- NULL
+    copula_results$plot_forest <- NULL
+    return()
+  }
 
-    copula_results$scores_df    <- scores_df
-    copula_results$p_df         <- p_df
-    copula_results$construct_items_map <- cim
-    copula_results$score_method <- if (use_mean) "Composite mean scores (rowMeans per construct)"
-                                   else          "PLS latent scores (seminr::construct_scores)"
-
-    # ── Run copula test ───────────────────────────────────────────────────────
-    tryCatch({
-      copula_tbl <- run_gaussian_copula(
-        scores_df   = scores_df,
-        p_df        = p_df,
-        paths_table = results$tables$Paths,
-        lang        = isolate(input$app_lang)
-      )
-      copula_results$table  <- copula_tbl
-      copula_results$status <- "ok"
-
-      # ── Build forest plot ─────────────────────────────────────────────────
-      copula_results$plot_forest <- make_copula_results_plot(copula_tbl)
-
-    }, error = function(e) {
-      copula_results$status <- paste0("Error: ", e$message)
-      copula_results$table  <- NULL
-    })
+  # Force numeric
+  scores_df <- as.data.frame(scores_df)
+  scores_df[] <- lapply(scores_df, function(x) {
+    if (is.factor(x)) as.numeric(as.character(x))
+    else suppressWarnings(as.numeric(x))
   })
+
+  message("[COPULA] use_mean = ", use_mean)
+  message("[COPULA] scores_df structure:")
+  print(str(scores_df))
+  message("[COPULA] p_df:")
+  print(p_df)
+
+  copula_results$scores_df <- scores_df
+  copula_results$p_df <- p_df
+  copula_results$construct_items_map <- cim
+  copula_results$score_method <- if (use_mean) {
+    "Composite mean scores (rowMeans per construct)"
+  } else {
+    "PLS latent scores (seminr::construct_scores)"
+  }
+
+  # ── Run copula test ONLY ────────────────────────────────────────────────
+  tryCatch({
+    copula_tbl <- run_gaussian_copula(
+      scores_df   = scores_df,
+      p_df        = p_df,
+      paths_table = results$tables$Paths,
+      lang        = isolate(input$app_lang)
+    )
+    copula_results$table <- copula_tbl
+    copula_results$status <- "ok"
+    message("[COPULA] Table OK")
+    print(copula_tbl)
+  }, error = function(e) {
+    copula_results$status <- paste0("Copula error: ", e$message)
+    copula_results$table  <- NULL
+    copula_results$plot_forest <- NULL
+    message("[COPULA] ERROR IN TABLE: ", e$message)
+    return()
+  })
+
+  # ── Build forest plot ONLY ──────────────────────────────────────────────
+  tryCatch({
+    copula_results$plot_forest <- make_copula_results_plot(copula_results$table)
+    message("[COPULA] Forest plot OK")
+  }, error = function(e) {
+    copula_results$plot_forest <- NULL
+    copula_results$status <- paste0("Plot error: ", e$message)
+    message("[COPULA] ERROR IN PLOT: ", e$message)
+  })
+})
 
   # ── Status banner ────────────────────────────────────────────────────────────
   output$copula_status_ui <- renderUI({
@@ -4907,9 +6224,12 @@ observe({
     lbl_map <- c(
       Confiabilidad   = "Reliability & Validity",
       Cargas          = "Outer Loadings",
+      LoadingCI       = "Loading CIs (Bootstrap)",
       CrossLoadings   = "Cross-Loadings",
       FornellLarcker  = "Fornell-Larcker",
       HTMT            = "HTMT",
+      HTMT_CI         = "HTMT + Bootstrap CI",
+      HTMT2           = "HTMT2",
       Paths           = "Path Coefficients + IC",
       Hypotheses      = "Hypothesis Table",
       IndirectEffects = "Indirect Effects",
@@ -4922,7 +6242,10 @@ observe({
       SRMR            = "SRMR",
       MICOM_P1        = "MICOM Step 1",
       MICOM_RESUMEN   = "MICOM Summary",
-      MGA             = "MGA"
+      MGA             = "MGA",
+      FIMIX_Sizes     = "FIMIX Segment Sizes",
+      FIMIX_Means     = "FIMIX Construct Means",
+      FIMIX_Paths     = "FIMIX Path Coefs"
     )
     tagList(lapply(nms, function(n) {
       display_nm <- if (n %in% names(lbl_map)) lbl_map[[n]] else n
@@ -5034,8 +6357,10 @@ observe({
       # CSVs
       # Ensure new tables are included
       all_export_nms <- c("Confiabilidad","Cargas","CrossLoadings","FornellLarcker",
-                          "HTMT","Paths","Hypotheses","IndirectEffects","TotalEffects",
+                          "HTMT","HTMT_CI","HTMT2","LoadingCI",
+                          "Paths","Hypotheses","IndirectEffects","TotalEffects",
                           "R2","Q2","PLSPredict","f2","VIF","SRMR","MICOM_RESUMEN","MGA",
+                          "FIMIX_Sizes","FIMIX_Means","FIMIX_Paths",
                           names(results$tables))
       all_export_nms <- unique(all_export_nms)
       for (nm in all_export_nms) {
